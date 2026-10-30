@@ -1,0 +1,17 @@
+{
+  "name": "draman-loan-services-management-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Starter implementation for the DRAMAN Loan Services Management System.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "notes": {
+    "runtime": "This prototype runs without npm install because this Codex shell has Node but no npm on PATH. Browser libraries are loaded from CDNs.",
+    "productionStack": "The blueprint target remains React, Tailwind CSS, Chart.js, Axios, Express.js, PostgreSQL, JWT, and bcrypt."
+  }
+}
