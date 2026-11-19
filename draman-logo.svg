@@ -1,0 +1,10 @@
+<svg width="160" height="160" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">DRAMAN Loan Services logo</title>
+  <desc id="desc">A dark blue shield with gold DLS lettering.</desc>
+  <rect width="160" height="160" rx="32" fill="#0B1F3A"/>
+  <path d="M80 20L124 36V72C124 102 105 130 80 140C55 130 36 102 36 72V36L80 20Z" fill="#102B4F" stroke="#D9A441" stroke-width="6"/>
+  <path d="M55 101V55H76C90 55 100 64 100 78C100 92 90 101 76 101H55Z" fill="#D9A441"/>
+  <path d="M70 88H76C83 88 88 84 88 78C88 72 83 68 76 68H70V88Z" fill="#0B1F3A"/>
+  <path d="M105 58V101H94V58H105Z" fill="#F7F4EC"/>
+  <path d="M50 113H110" stroke="#F7F4EC" stroke-width="7" stroke-linecap="round"/>
+</svg>
