@@ -29,6 +29,10 @@ Then open:
 http://localhost:4173
 ```
 
+## Deploy on Vercel
+
+`vercel.json` includes the HTML, JSX, CSS, and logo files in the server function bundle so the root route can serve them. Redeploy after changing this configuration. This prototype keeps application data in memory; Vercel may run requests in separate or recycled instances, so use persistent storage before relying on deployed data.
+
 ## Demo Accounts
 
 | Account type | Email | Staff ID | Password |
