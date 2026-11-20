@@ -1896,6 +1896,141 @@ button {
   accent-color: var(--harbor);
 }
 
+.topbar-popover-wrap {
+  position: relative;
+}
+
+.notification-button {
+  position: relative;
+}
+
+.notification-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  padding: 0 4px;
+  border: 2px solid var(--paper);
+  border-radius: 999px;
+  color: #ffffff;
+  background: #b42332;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.topbar-popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 30;
+  width: min(360px, calc(100vw - 28px));
+  max-height: min(480px, calc(100vh - 100px));
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--paper);
+  box-shadow: 0 16px 42px rgba(11, 31, 58, 0.2);
+}
+
+.topbar-popover__heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.popover-refresh {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--harbor);
+  background: var(--soft-surface);
+  cursor: pointer;
+}
+
+.popover-refresh .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.notification-list {
+  display: grid;
+}
+
+.notification-item {
+  display: grid;
+  gap: 5px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.notification-item:last-child {
+  border-bottom: 0;
+}
+
+.notification-item.warning {
+  border-left: 3px solid var(--brass);
+}
+
+.notification-item.info {
+  border-left: 3px solid var(--harbor);
+}
+
+.notification-item strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.notification-item p,
+.popover-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.notification-item time {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.popover-message {
+  padding: 16px;
+}
+
+.backup-status {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 30;
+  width: min(280px, calc(100vw - 28px));
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--paper);
+  box-shadow: 0 12px 32px rgba(11, 31, 58, 0.16);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.error-text {
+  color: #a51f2b !important;
+}
+
 .settings-notice {
   margin-bottom: 14px;
 }

@@ -1,15 +1,33 @@
 const { useEffect, useMemo, useRef, useState } = React;
 
 function apiError(error) {
+  if (error.response && error.response.status === 401) {
+    api.handleUnauthorized();
+  }
   const message = error.response && error.response.data && error.response.data.message;
   return new Error(message || error.message || "Request failed");
 }
 
+function handleApiResponseError(response, data) {
+  if (response.status === 401) api.handleUnauthorized();
+  throw new Error(data.message || "Request failed");
+}
+
 const api = {
   authHeaders() {
-    const savedSession = window.sessionStorage.getItem("draman-session");
-    const token = savedSession ? JSON.parse(savedSession).token : "";
-    return token ? { Authorization: `Bearer ${token}` } : {};
+    try {
+      const savedSession = window.sessionStorage.getItem("draman-session");
+      const token = savedSession ? JSON.parse(savedSession).token : "";
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    } catch (error) {
+      console.error("Could not read the saved session:", error);
+      return {};
+    }
+  },
+  handleUnauthorized() {
+    if (!window.sessionStorage.getItem("draman-session")) return;
+    window.sessionStorage.removeItem("draman-session");
+    window.dispatchEvent(new Event("draman-session-expired"));
   },
   async get(url) {
     if (window.axios) {
@@ -21,7 +39,7 @@ const api = {
     }
     const response = await fetch(url, { headers: this.authHeaders() });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.message || "Request failed");
+    if (!response.ok) handleApiResponseError(response, data);
     return { data };
   },
   async post(url, payload) {
@@ -38,7 +56,7 @@ const api = {
       body: JSON.stringify(payload)
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.message || "Request failed");
+    if (!response.ok) handleApiResponseError(response, data);
     return { data };
   },
   async put(url, payload) {
@@ -55,7 +73,7 @@ const api = {
       body: JSON.stringify(payload)
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.message || "Request failed");
+    if (!response.ok) handleApiResponseError(response, data);
     return { data };
   },
   async delete(url) {
@@ -71,7 +89,7 @@ const api = {
       headers: this.authHeaders()
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.message || "Request failed");
+    if (!response.ok) handleApiResponseError(response, data);
     return { data };
   }
 };
@@ -344,7 +362,7 @@ function ThemeToggle({ theme, onToggle }) {
   );
 }
 
-function LoginScreen({ onLogin, theme, onToggleTheme }) {
+function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
   const [mode, setMode] = useState("login");
   const [accountType, setAccountType] = useState("admin");
   const [role, setRole] = useState("Cashier");
@@ -357,7 +375,7 @@ function LoginScreen({ onLogin, theme, onToggleTheme }) {
     invitation_code: ""
   });
   const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState(initialMessage);
   const [loading, setLoading] = useState(false);
 
   function changeMode(nextMode) {
@@ -569,12 +587,8 @@ function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme }) {
       </div>
       <div className="topbar-actions">
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-        <button className="icon-button" type="button" title="Notifications">
-          <Icon name="bell" />
-        </button>
-        <button className="icon-button" type="button" title="System backup">
-          <Icon name="database-backup" />
-        </button>
+        <NotificationCenter />
+        <SystemBackup isAdmin={user.role === "Super Admin"} />
         <div className="text-right">
           <div className="topbar-user-name font-bold leading-tight">{user.full_name}</div>
           <div className="compact muted">{user.role}</div>
@@ -585,6 +599,122 @@ function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme }) {
         </button>
       </div>
     </header>
+  );
+}
+
+function NotificationCenter() {
+  const [notifications, setNotifications] = useState([]);
+  const [isOpen, setIsOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function loadNotifications() {
+    setLoading(true);
+    setError("");
+    try {
+      const { data } = await api.get("/api/notifications");
+      setNotifications(data.notifications);
+    } catch (requestError) {
+      setError(requestError.message || "Unable to load notifications.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggleNotifications() {
+    const shouldOpen = !isOpen;
+    setIsOpen(shouldOpen);
+    if (shouldOpen) loadNotifications();
+  }
+
+  return (
+    <div className="topbar-popover-wrap">
+      <button
+        className="icon-button notification-button"
+        type="button"
+        title="Notifications"
+        aria-label={`Notifications${notifications.length ? `, ${notifications.length} items` : ""}`}
+        aria-expanded={isOpen}
+        onClick={toggleNotifications}
+      >
+        <Icon name="bell" />
+        {notifications.length ? <span className="notification-count">{notifications.length > 9 ? "9+" : notifications.length}</span> : null}
+      </button>
+      {isOpen ? (
+        <section className="topbar-popover notification-popover" aria-label="Notifications">
+          <div className="topbar-popover__heading">
+            <strong>Notifications</strong>
+            <button type="button" className="popover-refresh" onClick={loadNotifications} disabled={loading} aria-label="Refresh notifications">
+              <Icon name="refresh-cw" />
+            </button>
+          </div>
+          {loading ? <p className="popover-message">Checking for updates...</p> : null}
+          {error ? <p className="popover-message error-text" role="alert">{error}</p> : null}
+          {!loading && !error ? (
+            <div className="notification-list">
+              {notifications.length ? notifications.map((item) => (
+                <article className={`notification-item ${item.level || "info"}`} key={item.id}>
+                  <strong>{item.title}</strong>
+                  <p>{item.message}</p>
+                  {item.created_at ? <time>{formatDate(item.created_at)}</time> : null}
+                </article>
+              )) : <p className="popover-message">You’re all caught up.</p>}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function SystemBackup({ isAdmin }) {
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+
+  async function downloadBackup() {
+    setLoading(true);
+    setError("");
+    setStatus("");
+    try {
+      const { data } = await api.post("/api/system-backup", {});
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = data.file_name;
+      document.body.appendChild(link);
+      link.click();
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+        link.remove();
+      }, 1000);
+      setStatus(`Backup downloaded at ${new Date(data.created_at).toLocaleTimeString()}.`);
+    } catch (backupError) {
+      setError(backupError.message || "Unable to create the system backup.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="topbar-popover-wrap">
+      <button
+        className="icon-button"
+        type="button"
+        title={isAdmin ? "Download system backup" : "System backup requires administrator access"}
+        aria-label="System backup"
+        onClick={downloadBackup}
+        disabled={!isAdmin || loading}
+      >
+        <Icon name="database-backup" />
+      </button>
+      {(status || error) ? (
+        <div className={`backup-status ${error ? "error-text" : ""}`} role={error ? "alert" : "status"}>
+          {error || status}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -2251,11 +2381,21 @@ function App() {
   });
   const [sessionReady, setSessionReady] = useState(false);
   const [theme, setTheme] = useState(() => window.localStorage.getItem("draman-theme") === "dark" ? "dark" : "light");
+  const [authNotice, setAuthNotice] = useState("");
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("draman-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    function handleSessionExpired() {
+      setAuthNotice("Your session expired or the server restarted. Sign in again to continue.");
+      setSession(null);
+    }
+    window.addEventListener("draman-session-expired", handleSessionExpired);
+    return () => window.removeEventListener("draman-session-expired", handleSessionExpired);
+  }, []);
 
   useEffect(() => {
     if (!session) {
@@ -2273,6 +2413,7 @@ function App() {
       .catch(() => {
         if (!active) return;
         window.sessionStorage.removeItem("draman-session");
+        setAuthNotice("Your session expired or the server restarted. Sign in again to continue.");
         setSession(null);
       })
       .finally(() => {
@@ -2288,11 +2429,13 @@ function App() {
     const remaining = new Date(session.expires_at).getTime() - Date.now();
     if (remaining <= 0) {
       window.sessionStorage.removeItem("draman-session");
+      setAuthNotice("Your session expired. Sign in again to continue.");
       setSession(null);
       return undefined;
     }
     const timeout = window.setTimeout(() => {
       window.sessionStorage.removeItem("draman-session");
+      setAuthNotice("Your session expired. Sign in again to continue.");
       setSession(null);
     }, Math.min(remaining, 2147483647));
     return () => window.clearTimeout(timeout);
@@ -2300,6 +2443,7 @@ function App() {
 
   function handleLogin(nextSession) {
     window.sessionStorage.setItem("draman-session", JSON.stringify(nextSession));
+    setAuthNotice("");
     setSession(nextSession);
   }
 
@@ -2321,7 +2465,7 @@ function App() {
   if (!sessionReady) return <main className="session-loading">Restoring your secure session...</main>;
 
   if (!session) {
-    return <LoginScreen onLogin={handleLogin} theme={theme} onToggleTheme={toggleTheme} />;
+    return <LoginScreen onLogin={handleLogin} theme={theme} onToggleTheme={toggleTheme} initialMessage={authNotice} />;
   }
 
   return <AppShell session={session} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />;

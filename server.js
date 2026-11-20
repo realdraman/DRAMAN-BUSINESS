@@ -4,9 +4,11 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { URL } = require("node:url");
 const { promisify } = require("node:util");
+const os = require("node:os");
 
 const PORT = Number(process.env.PORT || 4173);
 const scrypt = promisify(crypto.scrypt);
+const sessionStorePath = path.join(process.env.DRAMAN_DATA_DIR || path.join(os.tmpdir(), "draman-loan-services"), "sessions.json");
 const publicFiles = {
   "/": "index.html",
   "/index.html": "index.html",
@@ -171,7 +173,36 @@ const db = {
 
 const allowedRoles = ["Super Admin", "Cashier", "Loan Officer", "Inventory Manager"];
 const sessions = new Map();
+let sessionWrite = Promise.resolve();
 db.invitations = [];
+
+function sessionKey(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+async function loadSessions() {
+  try {
+    const stored = JSON.parse(await fs.readFile(sessionStorePath, "utf8"));
+    if (!Array.isArray(stored)) throw new Error("Session store must contain a list.");
+    stored.forEach(([key, session]) => {
+      if (/^[a-f0-9]{64}$/.test(key) && Number.isInteger(session.user_id) &&
+        Number.isFinite(session.expires_at) && session.expires_at > Date.now()) {
+        sessions.set(key, session);
+      }
+    });
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw new Error(`Could not load saved sessions: ${error.message}`);
+  }
+}
+
+function saveSessions() {
+  sessionWrite = sessionWrite.catch(() => {}).then(async () => {
+    await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
+    await fs.writeFile(sessionStorePath, JSON.stringify(Array.from(sessions.entries())), "utf8");
+  });
+  return sessionWrite;
+}
 
 async function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
   const hash = (await scrypt(password, salt, 64)).toString("hex");
@@ -200,10 +231,11 @@ function publicInvitation(invitation) {
 function sessionUser(request) {
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  const session = sessions.get(token);
+  const key = sessionKey(token);
+  const session = sessions.get(key);
   if (!session) return null;
   if (session.expires_at <= Date.now()) {
-    sessions.delete(token);
+    sessions.delete(key);
     return null;
   }
   const userId = session.user_id;
@@ -271,6 +303,62 @@ function clearCustomerData() {
   db.penalties = [];
   db.sales = [];
   db.agreements = [];
+}
+
+function buildNotifications(user) {
+  const notifications = [];
+  const isAdmin = user.role === "Super Admin";
+  const permissions = db.settings.security.permissions[user.role] || [];
+  const canSeeLoans = isAdmin || permissions.includes("loans");
+  const canSeeInventory = isAdmin || permissions.includes("inventory");
+
+  if (isAdmin) {
+    const pendingLoans = db.loans.filter((loan) => loan.status === "Pending");
+    if (pendingLoans.length) {
+      notifications.push({
+        id: "pending-loans",
+        title: "Loan approvals needed",
+        message: `${pendingLoans.length} loan application${pendingLoans.length === 1 ? "" : "s"} waiting for review.`,
+        level: "warning"
+      });
+    }
+  }
+
+  if (canSeeLoans) {
+    const overdueLoans = db.loans.filter((loan) => loan.balance > 0 && new Date(loan.due_date) < new Date());
+    if (overdueLoans.length) {
+      notifications.push({
+        id: "overdue-loans",
+        title: "Overdue loans",
+        message: `${overdueLoans.length} loan${overdueLoans.length === 1 ? "" : "s"} need follow-up.`,
+        level: "warning"
+      });
+    }
+  }
+
+  if (canSeeInventory) {
+    const lowStock = db.inventory.filter((item) => item.quantity <= 2);
+    if (lowStock.length) {
+      notifications.push({
+        id: "low-stock",
+        title: "Low stock alert",
+        message: `${lowStock.length} product${lowStock.length === 1 ? "" : "s"} have 2 or fewer items remaining.`,
+        level: "warning"
+      });
+    }
+  }
+
+  db.activity_logs.slice(0, 5).forEach((item) => {
+    notifications.push({
+      id: `activity-${item.id}`,
+      title: "Recent activity",
+      message: item.action,
+      level: "info",
+      created_at: item.created_at
+    });
+  });
+
+  return notifications.slice(0, 12);
 }
 
 async function parseBody(request) {
@@ -432,7 +520,14 @@ async function handleApi(request, response, pathname) {
     }
     const token = crypto.randomBytes(32).toString("base64url");
     const expiresAt = Date.now() + db.settings.security.session_timeout_hours * 60 * 60 * 1000;
-    sessions.set(token, { user_id: user.id, expires_at: expiresAt });
+    const key = sessionKey(token);
+    sessions.set(key, { user_id: user.id, expires_at: expiresAt });
+    try {
+      await saveSessions();
+    } catch (error) {
+      sessions.delete(key);
+      throw error;
+    }
     if (db.settings.security.audit_logging_enabled) {
       db.activity_logs.unshift({
         id: nextId(db.activity_logs),
@@ -519,7 +614,8 @@ async function handleApi(request, response, pathname) {
   if (request.method === "POST" && pathname === "/api/logout") {
     const authorization = request.headers.authorization || "";
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-    sessions.delete(token);
+    sessions.delete(sessionKey(token));
+    await saveSessions();
     sendJson(response, 200, { message: "Signed out" });
     return;
   }
@@ -534,13 +630,32 @@ async function handleApi(request, response, pathname) {
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     sendJson(response, 200, {
       user: publicUser(request.authUser),
-      expires_at: new Date(sessions.get(token).expires_at).toISOString()
+      expires_at: new Date(sessions.get(sessionKey(token)).expires_at).toISOString()
     });
     return;
   }
 
   if (request.method === "GET" && pathname === "/api/settings") {
     sendJson(response, 200, db.settings);
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/notifications") {
+    sendJson(response, 200, { notifications: buildNotifications(request.authUser) });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/system-backup") {
+    if (!requireSuperAdmin(request, response)) return;
+    const createdAt = todayIso();
+    const fileName = `draman-backup-${createdAt.replace(/[:.]/g, "-")}.json`;
+    sendJson(response, 200, {
+      format_version: 1,
+      application: "DRAMAN Loan Services Management System",
+      created_at: createdAt,
+      file_name: fileName,
+      data: JSON.parse(JSON.stringify(db))
+    });
     return;
   }
 
@@ -930,10 +1045,11 @@ const server = http.createServer(async (request, response) => {
 });
 
 hashPassword("admin123")
-  .then((demoPasswordHash) => {
+  .then(async (demoPasswordHash) => {
     for (const user of db.users) {
       user.password_hash = demoPasswordHash;
     }
+    await loadSessions();
     server.listen(PORT, () => {
       console.log(`DRAMAN Loan Services app running at http://localhost:${PORT}`);
     });
