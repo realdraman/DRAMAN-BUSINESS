@@ -41,6 +41,23 @@ const api = {
     if (!response.ok) throw new Error(data.message || "Request failed");
     return { data };
   },
+  async put(url, payload) {
+    if (window.axios) {
+      try {
+        return await window.axios.put(url, payload, { headers: this.authHeaders() });
+      } catch (error) {
+        throw apiError(error);
+      }
+    }
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.message || "Request failed");
+    return { data };
+  },
   async delete(url) {
     if (window.axios) {
       try {
@@ -114,6 +131,37 @@ const initialPaymentForm = {
   notes: ""
 };
 
+const initialSettings = {
+  business: {
+    company_name: "DRAMAN Loan Services",
+    logo_data: "",
+    contact_phone: "",
+    contact_email: "",
+    receipt_footer: "Thank you for your payment.",
+    sms_enabled: true,
+    sms_sender_id: ""
+  },
+  loan: {
+    default_interest_rate: 12,
+    processing_fee: 1000,
+    grace_period_days: 0,
+    late_penalty_rate: 3,
+    approval_threshold: 100000
+  },
+  security: {
+    session_timeout_hours: 24,
+    minimum_password_length: 10,
+    require_unique_staff_ids: true,
+    backup_schedule: "Daily",
+    audit_logging_enabled: true,
+    permissions: {
+      "Loan Officer": ["dashboard", "customers", "loans", "payments", "reports", "agreements"],
+      Cashier: ["dashboard", "payments", "reports"],
+      "Inventory Manager": ["dashboard", "inventory", "reports"]
+    }
+  }
+};
+
 const emptyProductForm = {
   product_name: "",
   category: "Furniture",
@@ -125,6 +173,30 @@ const emptyProductForm = {
   serial_number: "",
   image: ""
 };
+
+function useDraftState(name, initialValue, userId) {
+  const key = `draman-draft:${userId}:${name}`;
+  const [value, setValue] = useState(() => {
+    try {
+      const saved = window.sessionStorage.getItem(key);
+      if (!saved) return initialValue;
+      return JSON.parse(saved);
+    } catch (error) {
+      console.error(`Could not restore ${name} draft:`, error);
+      return initialValue;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      console.error(`Could not save ${name} draft:`, error);
+    }
+  }, [key, name, value]);
+
+  return [value, setValue];
+}
 
 function formatCurrency(value) {
   return new Intl.NumberFormat("en-KE", {
@@ -446,8 +518,12 @@ function LoginScreen({ onLogin, theme, onToggleTheme }) {
   );
 }
 
-function Sidebar({ activeView, setActiveView, user }) {
-  const allowedNav = navItems.filter((item) => item.roles.includes(user.role));
+function Sidebar({ activeView, setActiveView, user, permissions }) {
+  const allowedNav = navItems.filter((item) =>
+    user.role === "Super Admin"
+      ? item.roles.includes(user.role)
+      : item.id === "dashboard" || permissions.includes(item.id)
+  );
 
   return (
     <aside className="sidebar">
@@ -736,7 +812,7 @@ function LowStockAlerts({ items }) {
 }
 
 function CustomerManagement({ customers, refreshData, globalSearch, user }) {
-  const [form, setForm] = useState(emptyCustomerForm);
+  const [form, setForm] = useDraftState("customer", emptyCustomerForm, user.id);
   const [selectedTab, setSelectedTab] = useState("Personal details");
   const [message, setMessage] = useState("");
   const isSuperAdmin = user.role === "Super Admin";
@@ -792,7 +868,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
         description="Register customers, capture guarantor details, upload required documents, and review customer history."
         action={
           <div className="button-row mt-0">
-            <button className="secondary-button" type="button">
+            <button className="secondary-button" type="button" onClick={() => document.getElementById("customer-document-input")?.click()}>
               <Icon name="upload" />
               Upload Documents
             </button>
@@ -867,9 +943,9 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
             <Field label="Guarantor ID number">
               <input value={form.guarantor_id} onChange={(event) => setField("guarantor_id", event.target.value)} />
             </Field>
-            <div className="section-title">Upload Section</div>
+            <div className="section-title" id="customer-upload-section">Upload Section</div>
             <Field label="ID front image">
-              <input type="file" accept="image/*" onChange={(event) => setCustomerImage("id_front", event)} />
+              <input id="customer-document-input" type="file" accept="image/*" onChange={(event) => setCustomerImage("id_front", event)} />
               <ImagePreview src={form.id_front} label="ID front preview" />
             </Field>
             <Field label="ID back image">
@@ -973,20 +1049,26 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
   );
 }
 
-function LoanManagement({ customers, loans, refreshData, globalSearch }) {
-  const [form, setForm] = useState(initialLoanForm);
+function LoanManagement({ customers, loans, refreshData, globalSearch, user, settings }) {
+  const [form, setForm] = useDraftState("loan", {
+    ...initialLoanForm,
+    interest_rate: settings.loan.default_interest_rate,
+    processing_fee: settings.loan.processing_fee
+  }, user.id);
   const [message, setMessage] = useState("");
+  const [showPendingOnly, setShowPendingOnly] = useState(false);
 
   const filteredLoans = useMemo(() => {
     const query = globalSearch.trim().toLowerCase();
-    if (!query) return loans;
     return loans.filter((loan) =>
-      [loan.loan_code, loan.customer_name, loan.status, loan.assigned_officer]
-        .join(" ")
-        .toLowerCase()
-        .includes(query)
+      (!showPendingOnly || loan.status === "Pending") &&
+      (!query ||
+        [loan.loan_code, loan.customer_name, loan.status, loan.assigned_officer]
+          .join(" ")
+          .toLowerCase()
+          .includes(query))
     );
-  }, [loans, globalSearch]);
+  }, [loans, globalSearch, showPendingOnly]);
 
   const loanPreview = useMemo(() => {
     const principal = Number(form.principal_amount || 0);
@@ -1002,9 +1084,9 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
       total,
       periods,
       installment: periods ? Math.ceil(total / periods) : 0,
-      penalty: Math.ceil(total * 0.03)
+      penalty: Math.ceil(total * (Number(settings.loan.late_penalty_rate || 0) / 100))
     };
-  }, [form]);
+  }, [form, settings.loan.late_penalty_rate]);
 
   function setField(field, value) {
     setForm((current) => ({ ...current, [field]: value }));
@@ -1014,7 +1096,17 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
     event.preventDefault();
     const { data } = await api.post("/api/loans", form);
     setMessage(`${data.loan_code} created for ${data.customer_name}`);
-    setForm(initialLoanForm);
+    setForm({
+      ...initialLoanForm,
+      interest_rate: settings.loan.default_interest_rate,
+      processing_fee: settings.loan.processing_fee
+    });
+    await refreshData();
+  }
+
+  async function approveLoan(loan) {
+    const { data } = await api.post(`/api/loans/${loan.id}/approve`, {});
+    setMessage(`${data.loan_code} approved.`);
     await refreshData();
   }
 
@@ -1024,14 +1116,19 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
         title="Loan Management"
         description="Create loans, preview calculations, approve applications, and track balances by officer and due date."
         action={
-          <button className="secondary-button" type="button">
-            <Icon name="file-check-2" />
-            Approvals
-          </button>
+          <div className="button-row mt-0">
+            <button className="ghost-button" type="button" onClick={() => setShowPendingOnly((current) => !current)}>
+              <Icon name="file-check-2" />
+              {showPendingOnly ? "All Loans" : "Approvals"}
+            </button>
+            <button className="secondary-button" type="button" onClick={() => document.getElementById("loan-issuance")?.scrollIntoView({ behavior: "smooth" })}>
+              <Icon name="plus" />New Loan
+            </button>
+          </div>
         }
       />
       <section className="two-column">
-        <div className="panel">
+        <div className="panel" id="loan-issuance">
           <div className="panel-header">
             <h2>Loan Issuance</h2>
             <Badge tone="pending">Approval flow</Badge>
@@ -1078,13 +1175,9 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
                 <option>Monthly</option>
               </select>
             </Field>
-            <Field label="Loan status">
-              <select value={form.status} onChange={(event) => setField("status", event.target.value)}>
-                <option>Pending</option>
-                <option>Approved</option>
-                <option>Active</option>
-              </select>
-            </Field>
+            <div className="compact muted full">
+              Loans of {formatCurrency(settings.loan.approval_threshold)} or more require administrator approval.
+            </div>
             <div className="section-title">Automatic Calculations</div>
             <div className="loan-calculator full" aria-live="polite">
               <div className="loan-calculator__heading">
@@ -1126,7 +1219,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
                       : "Enter at least 1 installment"}
                   </span>
                   <div className="loan-penalty">
-                    <span>Late penalty estimate (3%)</span>
+                    <span>Late penalty estimate ({settings.loan.late_penalty_rate}% after {settings.loan.grace_period_days} grace days)</span>
                     <strong>{formatCurrency(loanPreview.penalty)}</strong>
                   </div>
                 </div>
@@ -1137,7 +1230,11 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
                 <Icon name="circle-dollar-sign" />
                 Create Loan
               </button>
-              <button className="ghost-button" type="button" onClick={() => setForm(initialLoanForm)}>
+              <button className="ghost-button" type="button" onClick={() => setForm({
+                ...initialLoanForm,
+                interest_rate: settings.loan.default_interest_rate,
+                processing_fee: settings.loan.processing_fee
+              })}>
                 <Icon name="rotate-ccw" />
                 Reset
               </button>
@@ -1161,6 +1258,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
                   <th>Due date</th>
                   <th>Status</th>
                   <th>Officer</th>
+                  {user.role === "Super Admin" ? <th>Action</th> : null}
                 </tr>
               </thead>
               <tbody>
@@ -1173,10 +1271,15 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
                     <td>{formatDate(loan.due_date)}</td>
                     <td><Badge tone={loan.status}>{loan.status}</Badge></td>
                     <td>{loan.assigned_officer}</td>
+                    {user.role === "Super Admin" ? (
+                      <td>{loan.status === "Pending" ? (
+                        <button className="secondary-button" type="button" onClick={() => approveLoan(loan)}>Approve</button>
+                      ) : <span className="compact muted">—</span>}</td>
+                    ) : null}
                   </tr>
                 )) : (
                   <tr>
-                    <td colSpan="7">
+                    <td colSpan={user.role === "Super Admin" ? "8" : "7"}>
                       <div className="empty-state">No loans issued yet.</div>
                     </td>
                   </tr>
@@ -1190,10 +1293,12 @@ function LoanManagement({ customers, loans, refreshData, globalSearch }) {
   );
 }
 
-function PaymentManagement({ loans, payments, refreshData, user }) {
-  const payableLoans = loans.filter((loan) => Number(loan.balance) > 0);
-  const [form, setForm] = useState(initialPaymentForm);
+function PaymentManagement({ loans, payments, refreshData, user, settings }) {
+  const payableLoans = loans.filter((loan) => Number(loan.balance) > 0 && loan.status !== "Pending");
+  const [form, setForm] = useDraftState("payment", initialPaymentForm, user.id);
+  const [lastReceipt, setLastReceipt] = useDraftState("payment-receipt", null, user.id);
   const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
   const selectedLoan = loans.find((loan) => loan.id === Number(form.loan_id));
 
   function setField(field, value) {
@@ -1202,13 +1307,44 @@ function PaymentManagement({ loans, payments, refreshData, user }) {
 
   async function savePayment(event) {
     event.preventDefault();
+    setError("");
     const { data } = await api.post("/api/payments", {
       ...form,
       received_by: user.id
     });
     setMessage(`${data.payment_code} received from ${data.customer_name}`);
+    setLastReceipt({
+      ...data,
+      balance_after: Math.max(0, Number(selectedLoan.balance) - Number(form.amount_paid))
+    });
     setForm(initialPaymentForm);
     await refreshData();
+  }
+
+  function printReceipt() {
+    if (!lastReceipt) return;
+    window.print();
+  }
+
+  function sendSmsConfirmation() {
+    setError("");
+    if (!lastReceipt) {
+      setError("Record a payment before sending its SMS confirmation.");
+      return;
+    }
+    const phoneNumber = String(lastReceipt.customer_phone || "").trim().replace(/[^\d+]/g, "");
+    if (!phoneNumber) {
+      setError("This customer does not have a phone number on file.");
+      return;
+    }
+    if (!settings.business.sms_enabled) {
+      setError("SMS confirmations are disabled in Business Settings.");
+      return;
+    }
+    const prefix = settings.business.sms_sender_id ? `${settings.business.sms_sender_id}: ` : "";
+    const smsBody = `${prefix}Payment of ${formatCurrency(lastReceipt.amount_paid)} received for ${lastReceipt.loan_code}. Remaining balance: ${formatCurrency(lastReceipt.balance_after)}. Receipt ${lastReceipt.payment_code}.`;
+    window.location.href = `sms:${phoneNumber}?body=${encodeURIComponent(smsBody)}`;
+    setMessage("Opening your messaging app with the payment confirmation ready to send.");
   }
 
   return (
@@ -1217,7 +1353,7 @@ function PaymentManagement({ loans, payments, refreshData, user }) {
         title="Payment Management"
         description="Receive repayments, support partial payments, update balances, add transaction references, and prepare receipts."
         action={
-          <button className="secondary-button" type="button">
+          <button className="secondary-button" type="button" onClick={printReceipt} disabled={!lastReceipt || Boolean(form.loan_id)}>
             <Icon name="printer" />
             Print Receipt
           </button>
@@ -1290,15 +1426,17 @@ function PaymentManagement({ loans, payments, refreshData, user }) {
                 <Icon name="banknote" />
                 Receive Payment
               </button>
-              <button className="ghost-button" type="button">
+              <button className="ghost-button" type="button" onClick={sendSmsConfirmation} disabled={!settings.business.sms_enabled}>
                 <Icon name="message-square-text" />
                 SMS Confirmation
               </button>
             </div>
+            <p className="compact muted full">SMS opens the device messaging app with the receipt details ready to send.</p>
             {message ? <div className="success-box full">{message}</div> : null}
+            {error ? <div className="error-box full" role="alert">{error}</div> : null}
           </form>
         </div>
-        <ReceiptPreview selectedLoan={selectedLoan} amount={form.amount_paid} user={user} />
+        <ReceiptPreview selectedLoan={selectedLoan} amount={form.amount_paid} user={user} receipt={selectedLoan ? null : lastReceipt} settings={settings} />
       </section>
       <section className="panel">
         <div className="panel-header">
@@ -1344,55 +1482,53 @@ function PaymentManagement({ loans, payments, refreshData, user }) {
   );
 }
 
-function ReceiptPreview({ selectedLoan, amount, user }) {
-  const paid = Number(amount || 0);
-  const balance = selectedLoan ? Math.max(0, Number(selectedLoan.balance) - paid) : 0;
+function ReceiptPreview({ selectedLoan, amount, user, receipt, settings }) {
+  const receiptLoan = selectedLoan || (receipt && {
+    customer_name: receipt.customer_name,
+    loan_code: receipt.loan_code
+  });
+  const paid = receipt ? Number(receipt.amount_paid) : Number(amount || 0);
+  const balance = receipt ? Number(receipt.balance_after) : selectedLoan ? Math.max(0, Number(selectedLoan.balance) - paid) : 0;
   return (
-    <div className="panel">
-      <div className="panel-header">
-        <h2>Receipt Layout</h2>
+    <div className="panel receipt-panel">
+      <div className="panel-header receipt-panel__header">
+        <div>
+          <h2>Receipt Layout</h2>
+          <span className="compact muted">Preview of the payment receipt</span>
+        </div>
         <Icon name="badge-check" />
       </div>
       <div className="panel-body">
-        <div className="brand-lockup mb-5">
-          <img src="/draman-logo.svg" alt="DRAMAN Loan Services logo" />
-          <div>
-            <div className="brand-title receipt-brand-title">DRAMAN Loan Services</div>
-            <div className="brand-subtitle receipt-brand-subtitle">Receipts and agreements desk</div>
-          </div>
-        </div>
-        <div className="profile-strip">
-          <div>
-            <span className="compact muted">Receipt number</span>
-            <strong>Auto-generated</strong>
-          </div>
-          <div>
-            <span className="compact muted">Customer name</span>
-            <strong>{selectedLoan ? selectedLoan.customer_name : "Select loan"}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Loan number</span>
-            <strong>{selectedLoan ? selectedLoan.loan_code : "Pending"}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Amount paid</span>
-            <strong>{formatCurrency(paid)}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Remaining balance</span>
-            <strong>{formatCurrency(balance)}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Payment date</span>
-            <strong>{formatDate(new Date())}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Officer signature</span>
-            <strong>{user.full_name}</strong>
-          </div>
-          <div>
-            <span className="compact muted">Footer</span>
-            <strong>Thank you</strong>
+        <div className="receipt-printable">
+          <div className="receipt-paper">
+            <div className="receipt-brand">
+              <img src={settings.business.logo_data || "/draman-logo.svg"} alt={`${settings.business.company_name} logo`} />
+              <div>
+                <div className="brand-title receipt-brand-title">{settings.business.company_name}</div>
+                <div className="brand-subtitle receipt-brand-subtitle">Payment receipt</div>
+                {settings.business.contact_phone ? <span>{settings.business.contact_phone}</span> : null}
+                {settings.business.contact_email ? <span>{settings.business.contact_email}</span> : null}
+              </div>
+            </div>
+            <div className="receipt-paper__title">
+              <span>OFFICIAL RECEIPT</span>
+              <strong>{receipt ? receipt.payment_code : "Pending payment"}</strong>
+            </div>
+            <div className="receipt-details">
+              <div><span>Customer</span><strong>{receiptLoan ? receiptLoan.customer_name : "Select loan"}</strong></div>
+              <div><span>Loan number</span><strong>{receiptLoan ? receiptLoan.loan_code : "Pending"}</strong></div>
+              <div><span>Payment date</span><strong>{receipt ? formatDate(receipt.payment_date) : formatDate(new Date())}</strong></div>
+              <div><span>Received by</span><strong>{receipt ? receipt.received_by_name : user.full_name}</strong></div>
+              <div className="receipt-details__amount"><span>Amount paid</span><strong>{formatCurrency(paid)}</strong></div>
+              <div><span>Remaining balance</span><strong>{formatCurrency(balance)}</strong></div>
+              <div><span>Payment method</span><strong>{receipt ? receipt.payment_method : "Pending"}</strong></div>
+              {receipt && receipt.transaction_code ? <div><span>Transaction reference</span><strong>{receipt.transaction_code}</strong></div> : null}
+            </div>
+            <div className="receipt-footer">
+              <span>{settings.business.receipt_footer}</span>
+              <strong>{receipt ? receipt.received_by_name : user.full_name}</strong>
+              <small>Authorized officer</small>
+            </div>
           </div>
         </div>
       </div>
@@ -1400,10 +1536,11 @@ function ReceiptPreview({ selectedLoan, amount, user }) {
   );
 }
 
-function InventoryManagement({ inventory, refreshData, user }) {
-  const [productForm, setProductForm] = useState(emptyProductForm);
+function InventoryManagement({ inventory, refreshData, user, settings }) {
+  const [productForm, setProductForm] = useDraftState("product", emptyProductForm, user.id);
   const [message, setMessage] = useState("");
   const isSuperAdmin = user.role === "Super Admin";
+  const canManageInventory = isSuperAdmin || (settings.security.permissions[user.role] || []).includes("inventory");
   const stockValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.buying_price), 0);
   const retailValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.selling_price), 0);
 
@@ -1418,7 +1555,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
 
   async function saveProduct(event) {
     event.preventDefault();
-    if (!isSuperAdmin) return;
+    if (!canManageInventory) return;
     const { data } = await api.post("/api/inventory", productForm);
     setMessage(`${data.product_name} added to inventory`);
     setProductForm(emptyProductForm);
@@ -1426,7 +1563,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
   }
 
   async function deleteProduct(product) {
-    if (!isSuperAdmin) return;
+    if (!canManageInventory) return;
     if (!window.confirm(`Delete ${product.product_name} from inventory?`)) return;
     const { data } = await api.delete(`/api/inventory/${product.id}`);
     setMessage(data.message);
@@ -1461,7 +1598,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
         <div className="metric-cell"><span className="compact muted">Products</span><strong>{inventory.length}</strong></div>
         <div className="metric-cell"><span className="compact muted">Low stock</span><strong>{inventory.filter((item) => item.quantity <= 2).length}</strong></div>
       </section>
-      {isSuperAdmin ? (
+      {canManageInventory ? (
         <section className="panel">
           <div className="panel-header">
             <h2>Add Product</h2>
@@ -1537,7 +1674,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
                 <th>Selling price</th>
                 <th>Condition</th>
                 <th>Serial number</th>
-                {isSuperAdmin ? <th>Control</th> : null}
+                {canManageInventory ? <th>Control</th> : null}
               </tr>
             </thead>
             <tbody>
@@ -1552,7 +1689,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
                   <td className="money">{formatCurrency(item.selling_price)}</td>
                   <td>{item.condition}</td>
                   <td>{item.serial_number}</td>
-                  {isSuperAdmin ? (
+                  {canManageInventory ? (
                     <td>
                       <button className="ghost-button" type="button" onClick={() => deleteProduct(item)}>
                         <Icon name="trash-2" />
@@ -1563,7 +1700,7 @@ function InventoryManagement({ inventory, refreshData, user }) {
                 </tr>
               )) : (
                 <tr>
-                  <td colSpan={isSuperAdmin ? "10" : "9"}>
+                  <td colSpan={canManageInventory ? "10" : "9"}>
                     <div className="empty-state">No products registered yet.</div>
                   </td>
                 </tr>
@@ -1577,19 +1714,56 @@ function InventoryManagement({ inventory, refreshData, user }) {
 }
 
 function Reports({ summary, loans, inventory }) {
-  const outstanding = loans.reduce((sum, loan) => sum + Number(loan.balance || 0), 0);
-  const defaulted = loans.filter((loan) => loan.status === "Defaulted").length;
+  const outstanding = summary?.cards.outstandingBalance ?? loans.reduce((sum, loan) => sum + Number(loan.balance || 0), 0);
+  const defaulted = summary?.cards.defaultedLoans ?? loans.filter((loan) => loan.status === "Defaulted").length;
+  const rows = [
+    ["Daily collections", summary?.cards.amountCollectedToday || 0],
+    ["Outstanding balances", outstanding],
+    ["Default reports", defaulted],
+    ["Stock value", summary?.cards.inventoryStockValue || 0]
+  ];
+
+  function downloadReport(format) {
+    let content;
+    let mimeType;
+    let extension;
+    if (format === "csv") {
+      content = [["Report", "Value"], ...rows]
+        .map((row) => row.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(","))
+        .join("\r\n");
+      mimeType = "text/csv;charset=utf-8";
+      extension = "csv";
+    } else {
+      const tableRows = [["Report", "Value"], ...rows]
+        .map((row) => `<tr>${row.map((value) => `<td>${String(value).replace(/[&<>"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character])}</td>`).join("")}</tr>`)
+        .join("");
+      content = `<!doctype html><html><head><meta charset="utf-8"></head><body><table>${tableRows}</table></body></html>`;
+      mimeType = "application/vnd.ms-excel";
+      extension = "xls";
+    }
+    const blob = new Blob(["\ufeff", content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `draman-report-${new Date().toISOString().slice(0, 10)}.${extension}`;
+    document.body.appendChild(link);
+    link.click();
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+      link.remove();
+    }, 1000);
+  }
 
   return (
-    <>
+    <div className="reports-printable">
       <SectionHeading
         title="Reports"
         description="Financial and inventory reporting with export-ready summaries for PDF, Excel, and CSV output."
         action={
           <div className="button-row mt-0">
-            <button className="ghost-button" type="button"><Icon name="file-spreadsheet" />Excel</button>
-            <button className="ghost-button" type="button"><Icon name="file-text" />CSV</button>
-            <button className="secondary-button" type="button"><Icon name="file-down" />PDF</button>
+            <button className="ghost-button" type="button" onClick={() => downloadReport("excel")}><Icon name="file-spreadsheet" />Excel</button>
+            <button className="ghost-button" type="button" onClick={() => downloadReport("csv")}><Icon name="file-text" />CSV</button>
+            <button className="secondary-button" type="button" onClick={() => window.print()}><Icon name="file-down" />PDF</button>
           </div>
         }
       />
@@ -1612,7 +1786,7 @@ function Reports({ summary, loans, inventory }) {
           </div>
         ))}
       </section>
-    </>
+    </div>
   );
 }
 
@@ -1651,29 +1825,111 @@ function Agreements({ agreements, loans }) {
   );
 }
 
-function Settings() {
+function Settings({ settings, onSettingsChanged }) {
+  const [draft, setDraft] = useState(settings);
+  const [saving, setSaving] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => setDraft(settings), [settings]);
+
+  function changeSetting(section, key, value) {
+    setDraft((current) => ({
+      ...current,
+      [section]: { ...current[section], [key]: value }
+    }));
+  }
+
+  async function saveSection(section, event) {
+    event.preventDefault();
+    setSaving(section);
+    setError("");
+    setMessage("");
+    try {
+      const { data } = await api.put(`/api/settings/${section}`, draft[section]);
+      onSettingsChanged(data);
+      setMessage(`${section.charAt(0).toUpperCase()}${section.slice(1)} settings saved.`);
+    } catch (saveError) {
+      setError(saveError.message || "Unable to save settings.");
+    } finally {
+      setSaving("");
+    }
+  }
+
+  async function uploadLogo(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type) || file.size > 1024 * 1024) {
+      setError("Choose a PNG, JPEG, WebP, or GIF image smaller than 1 MB.");
+      event.target.value = "";
+      return;
+    }
+    try {
+      changeSetting("business", "logo_data", await fileToDataUrl(file));
+    } catch (uploadError) {
+      setError(uploadError.message || "Unable to read the logo file.");
+    }
+  }
+
+  const sections = [
+    {
+      title: "Business Settings",
+      icon: "building-2",
+      section: "business",
+      fields: [
+        { key: "company_name", label: "Company name" },
+        { key: "logo_data", label: "Logo upload", type: "image" },
+        { key: "contact_phone", label: "Contact phone", type: "tel" },
+        { key: "contact_email", label: "Contact email", type: "email" },
+        { key: "receipt_footer", label: "Receipt footer", type: "textarea" },
+        { key: "sms_enabled", label: "Enable SMS confirmation", type: "checkbox" },
+        { key: "sms_sender_id", label: "SMS message prefix" }
+      ]
+    },
+    {
+      title: "Loan Settings",
+      icon: "badge-percent",
+      section: "loan",
+      fields: [
+        { key: "default_interest_rate", label: "Default interest rate (%)", type: "number", min: 0, max: 100, step: 0.1 },
+        { key: "late_penalty_rate", label: "Late penalty (%)", type: "number", min: 0, max: 100, step: 0.1 },
+        { key: "grace_period_days", label: "Grace period (days)", type: "number", min: 0, max: 365 },
+        { key: "processing_fee", label: "Default processing fee (KES)", type: "number", min: 0 },
+        { key: "approval_threshold", label: "Auto-approval limit (KES)", type: "number", min: 0 }
+      ]
+    },
+    {
+      title: "Security Settings",
+      icon: "shield-check",
+      section: "security",
+      fields: [
+        { key: "minimum_password_length", label: "Minimum password length", type: "number", min: 10, max: 128 },
+        { key: "session_timeout_hours", label: "Session timeout (hours)", type: "number", min: 1, max: 168 },
+        { key: "require_unique_staff_ids", label: "Require unique staff IDs", type: "checkbox" },
+        { key: "audit_logging_enabled", label: "Enable activity logging", type: "checkbox" },
+        { key: "backup_schedule", label: "Backup schedule", type: "select", options: ["Daily", "Weekly", "Monthly", "Disabled"] },
+        { key: "permissions", label: "Staff menu permissions", type: "permissions" }
+      ]
+    }
+  ];
+
   return (
     <>
-      <SectionHeading
-        title="Settings"
-        description="Configure business details, loan rules, penalty settings, backup schedules, SMS, and user permissions."
-      />
-      <section className="three-column">
-        <SettingsPanel
-          title="Business Settings"
-          icon="building-2"
-          fields={["Company name", "Logo upload", "Contact details", "Receipt footer", "SMS settings"]}
-        />
-        <SettingsPanel
-          title="Loan Settings"
-          icon="badge-percent"
-          fields={["Default interest rate", "Penalty rules", "Grace periods", "Processing fee", "Approval thresholds"]}
-        />
-        <SettingsPanel
-          title="Security Settings"
-          icon="shield-check"
-          fields={["Password rules", "Backup schedules", "User permissions", "Session timeout", "Activity logs"]}
-        />
+      <SectionHeading title="Settings" description="Update business identity and receipts, loan defaults and approvals, and account security policies." />
+      {message ? <div className="success-box settings-notice" role="status">{message}</div> : null}
+      {error ? <div className="error-box settings-notice" role="alert">{error}</div> : null}
+      <section className="three-column settings-grid">
+        {sections.map((group) => (
+          <SettingsPanel
+            {...group}
+            key={group.section}
+            values={draft[group.section]}
+            onChange={changeSetting}
+            onSave={saveSection}
+            onUploadLogo={uploadLogo}
+            saving={saving === group.section}
+          />
+        ))}
       </section>
     </>
   );
@@ -1681,9 +1937,10 @@ function Settings() {
 
 function TeamAccess() {
   const [role, setRole] = useState("Cashier");
+  const [count, setCount] = useState(1);
   const [team, setTeam] = useState([]);
   const [invitations, setInvitations] = useState([]);
-  const [issuedCode, setIssuedCode] = useState("");
+  const [issuedCodes, setIssuedCodes] = useState([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1706,11 +1963,11 @@ function TeamAccess() {
     setLoading(true);
     setError("");
     setMessage("");
-    setIssuedCode("");
+    setIssuedCodes([]);
     try {
-      const { data } = await api.post("/api/invitations", { role });
-      setIssuedCode(data.code);
-      setMessage(`Invitation created for ${role}. Share the code with the invited person.`);
+      const { data } = await api.post("/api/invitations", { role, count: Number(count) });
+      setIssuedCodes(data.invitations.map((item) => item.code));
+      setMessage(`${data.invitations.length} invitation code${data.invitations.length === 1 ? "" : "s"} created for ${role}.`);
       await refreshAccess();
     } catch (requestError) {
       setError(requestError.message || "Unable to create invitation.");
@@ -1721,8 +1978,8 @@ function TeamAccess() {
 
   async function copyInvitation() {
     try {
-      await navigator.clipboard.writeText(issuedCode);
-      setMessage("Invitation code copied.");
+      await navigator.clipboard.writeText(issuedCodes.join("\n"));
+      setMessage("Invitation codes copied.");
     } catch (copyError) {
       setError("Could not copy the code automatically. Select and copy it manually.");
     }
@@ -1753,20 +2010,23 @@ function TeamAccess() {
                   <option value="Super Admin">Administrator</option>
                 </select>
               </Field>
+              <Field label="Number of codes (1–50)">
+                <input type="number" min="1" max="50" value={count} onChange={(event) => setCount(event.target.value)} required />
+              </Field>
             </div>
             <div className="button-row">
               <button className="primary-button" type="submit" disabled={loading}>
-                <Icon name="key-round" />{loading ? "Creating..." : "Create invitation code"}
+                <Icon name="key-round" />{loading ? "Creating..." : "Create invitation codes"}
               </button>
             </div>
-            {issuedCode ? (
+            {issuedCodes.length ? (
               <div className="issued-code" role="status">
                 <div>
-                  <span className="compact muted">Share this code with the invited person. It is shown only once.</span>
-                  <strong>{issuedCode}</strong>
+                  <span className="compact muted">Share each single-use code with its invited person. Codes expire in 24 hours and are shown only once.</span>
+                  <ul className="issued-code__list">{issuedCodes.map((code) => <li key={code}><strong>{code}</strong></li>)}</ul>
                 </div>
                 <button className="ghost-button" type="button" onClick={copyInvitation}>
-                  <Icon name="copy" />Copy code
+                  <Icon name="copy" />Copy all codes
                 </button>
               </div>
             ) : null}
@@ -1820,23 +2080,76 @@ function TeamAccess() {
   );
 }
 
-function SettingsPanel({ title, icon, fields }) {
+function SettingsPanel({ title, icon, section, values, fields, onChange, onSave, onUploadLogo, saving }) {
   return (
     <div className="panel">
       <div className="panel-header">
         <h2>{title}</h2>
         <Icon name={icon} />
       </div>
-      <div className="panel-body activity-list">
+      <form className="panel-body settings-form" onSubmit={(event) => onSave(section, event)}>
         {fields.map((field) => (
-          <div className="activity-row" key={field}>
-            <strong>{field}</strong>
-            <button className="icon-button" type="button" title={`Edit ${field}`}>
-              <Icon name="pencil" />
-            </button>
-          </div>
+          <Field label={field.label} key={field.key}>
+            {field.type === "checkbox" ? (
+              <input type="checkbox" checked={Boolean(values[field.key])} onChange={(event) => onChange(section, field.key, event.target.checked)} />
+            ) : field.type === "textarea" ? (
+              <textarea value={values[field.key] || ""} onChange={(event) => onChange(section, field.key, event.target.value)} />
+            ) : field.type === "image" ? (
+              <>
+                <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={onUploadLogo} />
+                <ImagePreview src={values[field.key]} label="Business logo preview" compact />
+              </>
+            ) : field.type === "select" ? (
+              <select value={values[field.key]} onChange={(event) => onChange(section, field.key, event.target.value)}>
+                {field.options.map((option) => <option key={option}>{option}</option>)}
+              </select>
+            ) : field.type === "permissions" ? (
+              <div className="settings-permissions">
+                {[
+                  ["Loan Officer", ["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"]],
+                  ["Cashier", ["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"]],
+                  ["Inventory Manager", ["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"]]
+                ].map(([role, modules]) => (
+                  <fieldset key={role}>
+                    <legend>{role}</legend>
+                    <div className="settings-permissions__options">
+                      {modules.map((module) => (
+                        <label key={module}>
+                          <input
+                            type="checkbox"
+                            checked={values.permissions[role].includes(module)}
+                            onChange={(event) => {
+                              const currentModules = values.permissions[role];
+                              const nextModules = event.target.checked
+                                ? [...currentModules, module]
+                                : currentModules.filter((item) => item !== module);
+                              onChange(section, "permissions", { ...values.permissions, [role]: nextModules });
+                            }}
+                          />
+                          {module.charAt(0).toUpperCase() + module.slice(1)}
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                ))}
+              </div>
+            ) : (
+              <input
+                type={field.type || "text"}
+                min={field.min}
+                max={field.max}
+                step={field.step}
+                value={values[field.key] ?? ""}
+                onChange={(event) => onChange(section, field.key, event.target.value)}
+              />
+            )}
+          </Field>
         ))}
-      </div>
+        {section === "security" ? <p className="settings-help">Session-timeout changes apply on the next sign-in. Backup scheduling is saved as a preference; automated backups require a persistent production data store.</p> : null}
+        <button className="primary-button" type="submit" disabled={saving}>
+          <Icon name="save" />{saving ? "Saving..." : "Save changes"}
+        </button>
+      </form>
     </div>
   );
 }
@@ -1850,15 +2163,19 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
   const [payments, setPayments] = useState([]);
   const [inventory, setInventory] = useState([]);
   const [agreements, setAgreements] = useState([]);
+  const [settings, setSettings] = useState(initialSettings);
 
   async function refreshData() {
+    const settingsResult = await api.get("/api/settings");
+    const modules = settingsResult.data.security.permissions[session.user.role] || [];
+    const canAccess = (moduleName) => session.user.role === "Super Admin" || modules.includes(moduleName);
     const [summaryResult, customersResult, loansResult, paymentsResult, inventoryResult, agreementsResult] = await Promise.all([
       api.get("/api/summary"),
-      api.get("/api/customers"),
-      api.get("/api/loans"),
-      api.get("/api/payments"),
-      api.get("/api/inventory"),
-      api.get("/api/agreements")
+      canAccess("customers") ? api.get("/api/customers") : Promise.resolve({ data: [] }),
+      canAccess("loans") ? api.get("/api/loans") : Promise.resolve({ data: [] }),
+      canAccess("payments") ? api.get("/api/payments") : Promise.resolve({ data: [] }),
+      canAccess("inventory") ? api.get("/api/inventory") : Promise.resolve({ data: [] }),
+      canAccess("agreements") ? api.get("/api/agreements") : Promise.resolve({ data: [] })
     ]);
     setSummary(summaryResult.data);
     setCustomers(customersResult.data);
@@ -1866,6 +2183,7 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
     setPayments(paymentsResult.data);
     setInventory(inventoryResult.data);
     setAgreements(agreementsResult.data);
+    setSettings(settingsResult.data);
   }
 
   useEffect(() => {
@@ -1882,19 +2200,25 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
     refreshData,
     globalSearch: search,
     user: session.user,
-    theme
+    theme,
+    settings
   };
 
-  const visibleNav = navItems.filter((item) => item.roles.includes(session.user.role));
+  const permissions = settings.security.permissions[session.user.role] || [];
+  const visibleNav = navItems.filter((item) =>
+    session.user.role === "Super Admin"
+      ? item.roles.includes(session.user.role)
+      : item.id === "dashboard" || permissions.includes(item.id)
+  );
   useEffect(() => {
     if (!visibleNav.some((item) => item.id === activeView)) {
       setActiveView("dashboard");
     }
-  }, [session.user.role]);
+  }, [session.user.role, settings.security.permissions]);
 
   return (
     <div className="app-shell">
-      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} />
+      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} />
       <div className="workspace">
         <Topbar user={session.user} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} />
         <main className="main-content">
@@ -1906,7 +2230,7 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
           {activeView === "reports" ? <Reports {...viewProps} /> : null}
           {activeView === "agreements" ? <Agreements {...viewProps} /> : null}
           {activeView === "team" ? <TeamAccess /> : null}
-          {activeView === "settings" ? <Settings {...viewProps} /> : null}
+          {activeView === "settings" ? <Settings {...viewProps} onSettingsChanged={setSettings} /> : null}
         </main>
       </div>
     </div>
@@ -1916,7 +2240,14 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
 function App() {
   const [session, setSession] = useState(() => {
     const saved = window.sessionStorage.getItem("draman-session");
-    return saved ? JSON.parse(saved) : null;
+    if (!saved) return null;
+    try {
+      const restored = JSON.parse(saved);
+      return restored.expires_at && new Date(restored.expires_at).getTime() <= Date.now() ? null : restored;
+    } catch (error) {
+      console.error("Could not restore the saved session:", error);
+      return null;
+    }
   });
   const [sessionReady, setSessionReady] = useState(false);
   const [theme, setTheme] = useState(() => window.localStorage.getItem("draman-theme") === "dark" ? "dark" : "light");
@@ -1935,7 +2266,7 @@ function App() {
     api.get("/api/session")
       .then(({ data }) => {
         if (!active) return;
-        const restoredSession = { ...session, user: data.user };
+        const restoredSession = { ...session, user: data.user, expires_at: data.expires_at };
         window.sessionStorage.setItem("draman-session", JSON.stringify(restoredSession));
         setSession(restoredSession);
       })
@@ -1951,6 +2282,21 @@ function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!session || !session.expires_at) return undefined;
+    const remaining = new Date(session.expires_at).getTime() - Date.now();
+    if (remaining <= 0) {
+      window.sessionStorage.removeItem("draman-session");
+      setSession(null);
+      return undefined;
+    }
+    const timeout = window.setTimeout(() => {
+      window.sessionStorage.removeItem("draman-session");
+      setSession(null);
+    }, Math.min(remaining, 2147483647));
+    return () => window.clearTimeout(timeout);
+  }, [session]);
 
   function handleLogin(nextSession) {
     window.sessionStorage.setItem("draman-session", JSON.stringify(nextSession));

@@ -136,7 +136,37 @@ const db = {
   ],
   sales: [],
   agreements: [],
-  activity_logs: []
+  activity_logs: [],
+  settings: {
+    business: {
+      company_name: "DRAMAN Loan Services",
+      logo_data: "",
+      contact_phone: "",
+      contact_email: "",
+      receipt_footer: "Thank you for your payment.",
+      sms_enabled: true,
+      sms_sender_id: ""
+    },
+    loan: {
+      default_interest_rate: 12,
+      processing_fee: 1000,
+      grace_period_days: 0,
+      late_penalty_rate: 3,
+      approval_threshold: 100000
+    },
+    security: {
+      session_timeout_hours: 24,
+      minimum_password_length: 10,
+      require_unique_staff_ids: true,
+      backup_schedule: "Daily",
+      audit_logging_enabled: true,
+      permissions: {
+        "Loan Officer": ["dashboard", "customers", "loans", "payments", "reports", "agreements"],
+        Cashier: ["dashboard", "payments", "reports"],
+        "Inventory Manager": ["dashboard", "inventory", "reports"]
+      }
+    }
+  }
 };
 
 const allowedRoles = ["Super Admin", "Cashier", "Loan Officer", "Inventory Manager"];
@@ -170,7 +200,13 @@ function publicInvitation(invitation) {
 function sessionUser(request) {
   const authorization = request.headers.authorization || "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  const userId = sessions.get(token);
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expires_at <= Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  const userId = session.user_id;
   const user = db.users.find((item) => item.id === userId && item.status === "Active");
   if (user) request.authUser = user;
   return user;
@@ -207,9 +243,10 @@ function requireSuperAdmin(request, response) {
   return false;
 }
 
-function requireRoles(request, response, roles) {
-  if (request.authUser && roles.includes(request.authUser.role)) return true;
-  sendJson(response, 403, { message: "Your account does not have permission for this action" });
+function requireModule(request, response, moduleName) {
+  if (request.authUser && (request.authUser.role === "Super Admin" ||
+    (db.settings.security.permissions[request.authUser.role] || []).includes(moduleName))) return true;
+  sendJson(response, 403, { message: "Your account does not have permission for this section" });
   return false;
 }
 
@@ -258,7 +295,8 @@ function decoratedLoan(loan) {
   const customer = publicCustomer(loan.customer_id);
   return {
     ...loan,
-    customer_name: customer ? customer.full_name : "Unknown customer"
+    customer_name: customer ? customer.full_name : "Unknown customer",
+    customer_phone: customer ? customer.phone : ""
   };
 }
 
@@ -269,6 +307,7 @@ function decoratedPayment(payment) {
   return {
     ...payment,
     customer_name: customer ? customer.full_name : "Unknown customer",
+    customer_phone: customer ? customer.phone : "",
     loan_code: loan ? loan.loan_code : "Unknown loan",
     received_by_name: receiver ? receiver.full_name : "System"
   };
@@ -311,6 +350,8 @@ function buildSummary() {
       overdueLoans: overdueLoans.length,
       totalCustomers: db.customers.length,
       inventoryStockValue,
+      outstandingBalance: db.loans.reduce((sum, loan) => sum + money(loan.balance), 0),
+      defaultedLoans: db.loans.filter((loan) => loan.status === "Defaulted").length,
       monthlyProfit: Math.round(monthlyCollections * 0.18 + monthlyFees)
     },
     repaymentSeries,
@@ -390,15 +431,19 @@ async function handleApi(request, response, pathname) {
       return;
     }
     const token = crypto.randomBytes(32).toString("base64url");
-    sessions.set(token, user.id);
-    db.activity_logs.unshift({
-      id: nextId(db.activity_logs),
-      user_id: user.id,
-      action: `${user.full_name} logged in`,
-      created_at: todayIso()
-    });
+    const expiresAt = Date.now() + db.settings.security.session_timeout_hours * 60 * 60 * 1000;
+    sessions.set(token, { user_id: user.id, expires_at: expiresAt });
+    if (db.settings.security.audit_logging_enabled) {
+      db.activity_logs.unshift({
+        id: nextId(db.activity_logs),
+        user_id: user.id,
+        action: `${user.full_name} logged in`,
+        created_at: todayIso()
+      });
+    }
     sendJson(response, 200, {
       token,
+      expires_at: new Date(expiresAt).toISOString(),
       user: publicUser(user)
     });
     return;
@@ -420,8 +465,9 @@ async function handleApi(request, response, pathname) {
       sendJson(response, 400, { message: "Enter a staff ID containing at least 3 letters or numbers." });
       return;
     }
-    if (password.length < 10 || password.length > 128) {
-      sendJson(response, 400, { message: "Choose a password with at least 10 characters." });
+    const minimumPasswordLength = db.settings.security.minimum_password_length;
+    if (password.length < minimumPasswordLength || password.length > 128) {
+      sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
       return;
     }
 
@@ -439,7 +485,7 @@ async function handleApi(request, response, pathname) {
       sendJson(response, 409, { message: "An account already uses that email address." });
       return;
     }
-    if (db.users.some((item) => item.employee_id.toUpperCase() === employeeId)) {
+    if (db.settings.security.require_unique_staff_ids && db.users.some((item) => item.employee_id.toUpperCase() === employeeId)) {
       sendJson(response, 409, { message: "That staff ID is already registered. Contact your admin if this is your ID." });
       return;
     }
@@ -458,12 +504,14 @@ async function handleApi(request, response, pathname) {
     db.users.push(user);
     invitation.used_at = todayIso();
     invitation.used_by = user.id;
-    db.activity_logs.unshift({
-      id: nextId(db.activity_logs),
-      user_id: invitation.created_by,
-      action: `${user.full_name} registered as ${user.role}`,
-      created_at: todayIso()
-    });
+    if (db.settings.security.audit_logging_enabled) {
+      db.activity_logs.unshift({
+        id: nextId(db.activity_logs),
+        user_id: invitation.created_by,
+        action: `${user.full_name} registered as ${user.role}`,
+        created_at: todayIso()
+      });
+    }
     sendJson(response, 201, { message: "Account created. You can now sign in.", user: publicUser(user) });
     return;
   }
@@ -482,7 +530,81 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "GET" && pathname === "/api/session") {
-    sendJson(response, 200, { user: publicUser(request.authUser) });
+    const authorization = request.headers.authorization || "";
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    sendJson(response, 200, {
+      user: publicUser(request.authUser),
+      expires_at: new Date(sessions.get(token).expires_at).toISOString()
+    });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/settings") {
+    sendJson(response, 200, db.settings);
+    return;
+  }
+
+  const settingsMatch = pathname.match(/^\/api\/settings\/(business|loan|security)$/);
+  if (request.method === "PUT" && settingsMatch) {
+    if (!requireSuperAdmin(request, response)) return;
+    const section = settingsMatch[1];
+    const body = await parseBody(request);
+    const current = db.settings[section];
+    const numericRanges = {
+      default_interest_rate: [0, 100],
+      processing_fee: [0, 100000000],
+      grace_period_days: [0, 365],
+      late_penalty_rate: [0, 100],
+      approval_threshold: [0, 1000000000],
+      session_timeout_hours: [1, 168],
+      minimum_password_length: [10, 128]
+    };
+    const booleanFields = ["sms_enabled", "require_unique_staff_ids", "audit_logging_enabled"];
+    for (const [key, value] of Object.entries(body)) {
+      if (!Object.prototype.hasOwnProperty.call(current, key)) {
+        sendJson(response, 400, { message: `Unknown ${section} setting: ${key}` });
+        return;
+      }
+      if (numericRanges[key]) {
+        const [minimum, maximum] = numericRanges[key];
+        if (!Number.isFinite(Number(value)) || Number(value) < minimum || Number(value) > maximum) {
+          sendJson(response, 400, { message: `${key} must be between ${minimum} and ${maximum}.` });
+          return;
+        }
+        body[key] = Number(value);
+      } else if (booleanFields.includes(key)) {
+        if (typeof value !== "boolean") {
+          sendJson(response, 400, { message: `${key} must be true or false.` });
+          return;
+        }
+      } else if (key === "logo_data") {
+        if (typeof value !== "string" || value.length > 1500000 ||
+          (value !== "" && !/^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(value))) {
+          sendJson(response, 400, { message: "Choose a supported image no larger than 1 MB for the business logo." });
+          return;
+        }
+      } else if (key === "backup_schedule") {
+        if (!["Daily", "Weekly", "Monthly", "Disabled"].includes(value)) {
+          sendJson(response, 400, { message: "Choose a valid backup schedule." });
+          return;
+        }
+      } else if (key === "permissions") {
+        const validModules = ["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"];
+        const validRoles = ["Loan Officer", "Cashier", "Inventory Manager"];
+        if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).length !== validRoles.length ||
+          validRoles.some((role) => !Array.isArray(value[role]) ||
+            value[role].some((moduleName) => !validModules.includes(moduleName)))) {
+          sendJson(response, 400, { message: "Choose valid menu permissions for each staff role." });
+          return;
+        }
+      } else if (typeof value !== "string" || value.length > 500) {
+        sendJson(response, 400, { message: `${key} must be a text value of 500 characters or fewer.` });
+        return;
+      }
+    }
+    db.settings[section] = { ...current, ...body };
+    sendJson(response, 200, db.settings);
     return;
   }
 
@@ -506,19 +628,31 @@ async function handleApi(request, response, pathname) {
       sendJson(response, 400, { message: "Choose a valid team role." });
       return;
     }
-    const code = `DRM-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
-    const invitation = {
-      id: nextId(db.invitations),
-      role: body.role,
-      code_hash: crypto.createHash("sha256").update(code).digest("hex"),
-      created_by: request.authUser.id,
-      created_at: todayIso(),
-      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      used_at: null,
-      used_by: null
-    };
-    db.invitations.unshift(invitation);
-    sendJson(response, 201, { invitation: publicInvitation(invitation), code });
+    const count = body.count === undefined ? 1 : Number(body.count);
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      sendJson(response, 400, { message: "Create between 1 and 50 invitation codes at a time." });
+      return;
+    }
+    const createdInvitations = Array.from({ length: count }, () => {
+      const code = `DRM-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+      const invitation = {
+        id: nextId(db.invitations),
+        role: body.role,
+        code_hash: crypto.createHash("sha256").update(code).digest("hex"),
+        created_by: request.authUser.id,
+        created_at: todayIso(),
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+        used_by: null
+      };
+      db.invitations.unshift(invitation);
+      return { invitation: publicInvitation(invitation), code };
+    });
+    sendJson(response, 201, {
+      invitations: createdInvitations,
+      invitation: createdInvitations[0].invitation,
+      code: createdInvitations[0].code
+    });
     return;
   }
 
@@ -528,12 +662,13 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "GET" && pathname === "/api/customers") {
+    if (!requireModule(request, response, "customers")) return;
     sendJson(response, 200, db.customers);
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/customers") {
-    if (!requireRoles(request, response, ["Super Admin", "Loan Officer"])) return;
+    if (!requireModule(request, response, "customers")) return;
     const body = await parseBody(request);
     const customer = {
       id: nextId(db.customers),
@@ -597,23 +732,26 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "GET" && pathname === "/api/guarantors") {
+    if (!requireModule(request, response, "customers")) return;
     sendJson(response, 200, db.guarantors);
     return;
   }
 
   if (request.method === "GET" && pathname === "/api/loans") {
+    if (!requireModule(request, response, "loans")) return;
     sendJson(response, 200, db.loans.map(decoratedLoan));
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/loans") {
-    if (!requireRoles(request, response, ["Super Admin", "Loan Officer"])) return;
+    if (!requireModule(request, response, "loans")) return;
     const body = await parseBody(request);
     const principal = money(body.principal_amount);
     const interestRate = money(body.interest_rate);
     const processingFee = money(body.processing_fee);
     const totalInterest = Math.round(principal * (interestRate / 100));
     const totalPayable = principal + totalInterest + processingFee;
+    const loanRequiresApproval = principal >= db.settings.loan.approval_threshold;
     const loan = {
       id: nextId(db.loans),
       loan_code: nextCode("LOAN", db.loans, "loan_code"),
@@ -627,9 +765,9 @@ async function handleApi(request, response, pathname) {
       repayment_frequency: body.repayment_frequency || "Monthly",
       start_date: body.start_date || dateOnly(new Date()),
       due_date: body.due_date || dateOnly(new Date()),
-      status: body.status || "Pending",
+      status: loanRequiresApproval ? "Pending" : "Approved",
       assigned_officer: body.assigned_officer || "Mercy Atieno",
-      approved_by: body.approved_by || 1,
+      approved_by: loanRequiresApproval ? null : request.authUser.id,
       created_at: todayIso()
     };
     db.loans.unshift(loan);
@@ -637,17 +775,48 @@ async function handleApi(request, response, pathname) {
     return;
   }
 
+  const loanApprovalMatch = pathname.match(/^\/api\/loans\/(\d+)\/approve$/);
+  if (request.method === "POST" && loanApprovalMatch) {
+    if (!requireSuperAdmin(request, response)) return;
+    const loan = db.loans.find((item) => item.id === Number(loanApprovalMatch[1]));
+    if (!loan) {
+      sendJson(response, 404, { message: "Loan not found" });
+      return;
+    }
+    if (loan.status !== "Pending") {
+      sendJson(response, 409, { message: "Only pending loans can be approved." });
+      return;
+    }
+    loan.status = "Approved";
+    loan.approved_by = request.authUser.id;
+    if (db.settings.security.audit_logging_enabled) {
+      db.activity_logs.unshift({
+        id: nextId(db.activity_logs),
+        user_id: request.authUser.id,
+        action: `${request.authUser.full_name} approved ${loan.loan_code}`,
+        created_at: todayIso()
+      });
+    }
+    sendJson(response, 200, decoratedLoan(loan));
+    return;
+  }
+
   if (request.method === "GET" && pathname === "/api/payments") {
+    if (!requireModule(request, response, "payments")) return;
     sendJson(response, 200, db.payments.map(decoratedPayment));
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/payments") {
-    if (!requireRoles(request, response, ["Super Admin", "Loan Officer", "Cashier"])) return;
+    if (!requireModule(request, response, "payments")) return;
     const body = await parseBody(request);
     const loan = db.loans.find((item) => item.id === Number(body.loan_id));
     if (!loan) {
       sendJson(response, 404, { message: "Loan not found" });
+      return;
+    }
+    if (loan.status === "Pending") {
+      sendJson(response, 409, { message: "This loan must be approved before accepting payment." });
       return;
     }
     const amount = money(body.amount_paid);
@@ -678,12 +847,13 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "GET" && pathname === "/api/inventory") {
+    if (!requireModule(request, response, "inventory")) return;
     sendJson(response, 200, db.inventory);
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/inventory") {
-    if (!requireSuperAdmin(request, response)) return;
+    if (!requireModule(request, response, "inventory")) return;
     const body = await parseBody(request);
     const product = {
       id: nextId(db.inventory),
@@ -713,7 +883,7 @@ async function handleApi(request, response, pathname) {
 
   const inventoryDeleteMatch = pathname.match(/^\/api\/inventory\/(\d+)$/);
   if (request.method === "DELETE" && inventoryDeleteMatch) {
-    if (!requireSuperAdmin(request, response)) return;
+    if (!requireModule(request, response, "inventory")) return;
     const productId = Number(inventoryDeleteMatch[1]);
     const existingProduct = db.inventory.find((product) => product.id === productId);
     if (!existingProduct) {
@@ -732,6 +902,7 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "GET" && pathname === "/api/agreements") {
+    if (!requireModule(request, response, "agreements")) return;
     sendJson(response, 200, db.agreements);
     return;
   }
