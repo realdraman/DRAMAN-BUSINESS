@@ -18,6 +18,7 @@ const privateDataDir = path.resolve(
 );
 const sessionStorePath = path.join(privateDataDir, "sessions.json");
 const authStorePath = path.join(privateDataDir, "auth-store.json");
+const adminCredentialsPath = path.join(privateDataDir, "admin-credentials.json");
 const businessDataPath = path.join(privateDataDir, "business-data.json");
 const bootstrapCredentialsPath = path.join(privateDataDir, "first-admin-credentials.txt");
 const passwordResetOutboxPath = path.join(privateDataDir, "password-reset-outbox");
@@ -237,11 +238,32 @@ async function loadPrivateData() {
     if (error.code !== "ENOENT") throw new Error(`Could not load private account data: ${error.message}`);
   }
 
-  const initialPassword = crypto.randomBytes(24).toString("base64url");
+  let privateBootstrap = null;
+  try {
+    privateBootstrap = JSON.parse(await fs.readFile(adminCredentialsPath, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw new Error(`Could not read private administrator credentials: ${error.message}`);
+  }
+  if (privateBootstrap && (
+    typeof privateBootstrap.email !== "string" ||
+    typeof privateBootstrap.password !== "string" ||
+    !validEmail(privateBootstrap.email.trim().toLowerCase()) ||
+    privateBootstrap.password.length < 1 ||
+    privateBootstrap.password.length > 128
+  )) {
+    throw new Error("Private administrator credentials must contain a valid email and a password of 1 to 128 characters.");
+  }
+
+  const initialEmail = String(
+    process.env.DRAMAN_ADMIN_EMAIL || (privateBootstrap && privateBootstrap.email) || "admin@draman.co.ke"
+  ).trim().toLowerCase();
+  const configuredPassword = process.env.DRAMAN_ADMIN_PASSWORD || (privateBootstrap && privateBootstrap.password);
+  const initialPassword = configuredPassword || crypto.randomBytes(24).toString("base64url");
+  if (!validEmail(initialEmail)) throw new Error("DRAMAN_ADMIN_EMAIL must be a valid email address.");
   db.users = [{
     id: 1,
     full_name: "Administrator",
-    email: String(process.env.DRAMAN_ADMIN_EMAIL || "admin@draman.co.ke").trim().toLowerCase(),
+    email: initialEmail,
     employee_id: "ADM-001",
     phone: "",
     role: "Super Admin",
@@ -251,6 +273,14 @@ async function loadPrivateData() {
   }];
   passwordResetTokens = [];
   await saveAuthStore();
+  if (privateBootstrap) {
+    await fs.unlink(adminCredentialsPath);
+    if (initialPassword.length < db.settings.security.minimum_password_length) {
+      console.warn("The configured initial administrator password is shorter than the password policy. Change it after signing in.");
+    }
+    console.log("Created the initial administrator account from private credentials.");
+    return;
+  }
   await writePrivateFile(
     bootstrapCredentialsPath,
     `Initial administrator sign-in\nEmail: ${db.users[0].email}\nPassword: ${initialPassword}\n\nChange this password and email after signing in. This file is stored outside the project folder and should be deleted after use.\n`

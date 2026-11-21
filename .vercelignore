@@ -4,6 +4,7 @@
 private-data/
 password-reset-outbox/
 first-admin-credentials.txt
+admin-credentials.json
 auth-store.json
 business-data.json
 sessions.json
