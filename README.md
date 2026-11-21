@@ -35,13 +35,13 @@ http://localhost:4173
 
 ## Deploy on Vercel
 
-`vercel.json` includes the HTML, JSX, CSS, and logo files in the server function bundle so the root route can serve them. Redeploy after changing this configuration. Local data files are excluded from Git and Vercel bundles. Vercel's serverless filesystem is not persistent, so use a managed database and external file storage before relying on deployed data.
+`vercel.json` includes the HTML, JSX, CSS, and logo files in the server function bundle so the root route can serve them. The Node request handler is exported for Vercel and starts a listener only for local runs. Redeploy after changing this configuration. Local data files are excluded from Git and Vercel bundles. Vercel writes private data to `/tmp/private-data`; this filesystem is temporary and not shared across instances, so use a managed database and external file storage before relying on deployed data.
 
 ## First Run and Private Data
 
 On first run, the app creates a random administrator password and saves it in `first-admin-credentials.txt` inside the private data directory. Sign in with the listed email and password, then change the email and password using **My account**. The one-time credentials file is removed after the administrator signs in.
 
-By default, private data is stored outside the project: `%LOCALAPPDATA%\DRAMAN Loan Services` on Windows, `~/Library/Application Support/DRAMAN Loan Services` on macOS, or `${XDG_DATA_HOME:-~/.local/share}/draman-loan-services` on Linux. Override this path with `DRAMAN_DATA_DIR`. Account credentials (salted password hashes), invitations, password-reset tokens, and business/customer records are stored there with private filesystem permissions. `.gitignore` and `.vercelignore` also exclude local credential/data files from publication.
+By default, private data is stored outside the project: `%LOCALAPPDATA%\DRAMAN Loan Services` on Windows, `~/Library/Application Support/DRAMAN Loan Services` on macOS, or `${XDG_DATA_HOME:-~/.local/share}/draman-loan-services` on Linux. On Vercel, data is written to `/tmp/private-data`. Override either path with `DRAMAN_DATA_DIR`. Account credentials (salted password hashes), invitations, password-reset tokens, and business/customer records are stored there with private filesystem permissions. `.gitignore` and `.vercelignore` also exclude local credential/data files from publication.
 
 Anyone may request an account with a personal email address. Uninvited requests remain pending until an administrator assigns a role and approves them; invitation codes still activate the role they were issued for. Sign-in uses email and password only. Sessions expire after 24 hours by default and survive a local server restart. Forgot-password links expire after one hour and can only be used once.
 

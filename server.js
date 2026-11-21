@@ -13,7 +13,9 @@ const defaultDataDir = process.env.LOCALAPPDATA
   : process.platform === "darwin"
     ? path.join(os.homedir(), "Library", "Application Support", "DRAMAN Loan Services")
     : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "draman-loan-services");
-const privateDataDir = path.resolve(process.env.DRAMAN_DATA_DIR || defaultDataDir);
+const privateDataDir = path.resolve(
+  process.env.DRAMAN_DATA_DIR || (process.env.VERCEL ? "/tmp/private-data" : defaultDataDir)
+);
 const sessionStorePath = path.join(privateDataDir, "sessions.json");
 const authStorePath = path.join(privateDataDir, "auth-store.json");
 const businessDataPath = path.join(privateDataDir, "business-data.json");
@@ -1312,9 +1314,25 @@ async function handleApi(request, response, pathname) {
   sendJson(response, 404, { message: "API route not found" });
 }
 
-const server = http.createServer(async (request, response) => {
+const initialization = loadPrivateData()
+  .then(async () => {
+    await saveBusinessData();
+    await loadSessions();
+    return null;
+  })
+  .catch((error) => {
+    console.error("Could not initialize private application data:", error);
+    return error;
+  });
+
+const app = async (request, response) => {
   try {
-    const url = new URL(request.url, `http://${request.headers.host}`);
+    const initializationError = await initialization;
+    if (initializationError) {
+      sendJson(response, 500, { message: "Could not initialize private application data." });
+      return;
+    }
+    const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
     if (url.pathname.startsWith("/api/")) {
       response.persistData = ["POST", "PUT", "PATCH", "DELETE"].includes(request.method);
       await handleApi(request, response, url.pathname);
@@ -1325,17 +1343,18 @@ const server = http.createServer(async (request, response) => {
     console.error(error);
     sendJson(response, 500, { message: "Internal server error" });
   }
-});
+};
 
-loadPrivateData()
-  .then(async () => {
-    await saveBusinessData();
-    await loadSessions();
-    server.listen(PORT, () => {
+if (!process.env.VERCEL) {
+  initialization.then((error) => {
+    if (error) {
+      process.exitCode = 1;
+      return;
+    }
+    http.createServer(app).listen(PORT, () => {
       console.log(`DRAMAN Loan Services app running at http://localhost:${PORT}`);
     });
-  })
-  .catch((error) => {
-    console.error("Could not initialize private application data:", error);
-    process.exitCode = 1;
   });
+}
+
+module.exports = app;
