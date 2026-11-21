@@ -1,0 +1,9 @@
+.env
+.env.*
+.draman-private/
+private-data/
+password-reset-outbox/
+first-admin-credentials.txt
+auth-store.json
+business-data.json
+sessions.json

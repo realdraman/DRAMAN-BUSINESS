@@ -8,7 +8,17 @@ const os = require("node:os");
 
 const PORT = Number(process.env.PORT || 4173);
 const scrypt = promisify(crypto.scrypt);
-const sessionStorePath = path.join(process.env.DRAMAN_DATA_DIR || path.join(os.tmpdir(), "draman-loan-services"), "sessions.json");
+const defaultDataDir = process.env.LOCALAPPDATA
+  ? path.join(process.env.LOCALAPPDATA, "DRAMAN Loan Services")
+  : process.platform === "darwin"
+    ? path.join(os.homedir(), "Library", "Application Support", "DRAMAN Loan Services")
+    : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "draman-loan-services");
+const privateDataDir = path.resolve(process.env.DRAMAN_DATA_DIR || defaultDataDir);
+const sessionStorePath = path.join(privateDataDir, "sessions.json");
+const authStorePath = path.join(privateDataDir, "auth-store.json");
+const businessDataPath = path.join(privateDataDir, "business-data.json");
+const bootstrapCredentialsPath = path.join(privateDataDir, "first-admin-credentials.txt");
+const passwordResetOutboxPath = path.join(privateDataDir, "password-reset-outbox");
 const publicFiles = {
   "/": "index.html",
   "/index.html": "index.html",
@@ -35,48 +45,7 @@ const dateOnly = (date) => new Date(date).toISOString().slice(0, 10);
 const money = (value) => Number.parseFloat(value || 0);
 
 const db = {
-  users: [
-    {
-      id: 1,
-      full_name: "Charles Muhoni",
-      email: "admin@draman.co.ke",
-      employee_id: "ADM-001",
-      phone: "+254 700 100 001",
-      role: "Super Admin",
-      status: "Active",
-      created_at: "2026-01-12T08:00:00.000Z"
-    },
-    {
-      id: 2,
-      full_name: "Mercy Atieno",
-      email: "officer@draman.co.ke",
-      employee_id: "LOAN-001",
-      phone: "+254 700 100 002",
-      role: "Loan Officer",
-      status: "Active",
-      created_at: "2026-02-03T08:00:00.000Z"
-    },
-    {
-      id: 3,
-      full_name: "Peter Maina",
-      email: "cashier@draman.co.ke",
-      employee_id: "CASH-001",
-      phone: "+254 700 100 003",
-      role: "Cashier",
-      status: "Active",
-      created_at: "2026-02-10T08:00:00.000Z"
-    },
-    {
-      id: 4,
-      full_name: "Amina Hassan",
-      email: "inventory@draman.co.ke",
-      employee_id: "INV-001",
-      phone: "+254 700 100 004",
-      role: "Inventory Manager",
-      status: "Active",
-      created_at: "2026-03-01T08:00:00.000Z"
-    }
-  ],
+  users: [],
   customers: [],
   guarantors: [],
   loans: [],
@@ -174,6 +143,9 @@ const db = {
 const allowedRoles = ["Super Admin", "Cashier", "Loan Officer", "Inventory Manager"];
 const sessions = new Map();
 let sessionWrite = Promise.resolve();
+let authStoreWrite = Promise.resolve();
+let businessDataWrite = Promise.resolve();
+let passwordResetTokens = [];
 db.invitations = [];
 
 function sessionKey(token) {
@@ -198,10 +170,90 @@ async function loadSessions() {
 
 function saveSessions() {
   sessionWrite = sessionWrite.catch(() => {}).then(async () => {
-    await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
-    await fs.writeFile(sessionStorePath, JSON.stringify(Array.from(sessions.entries())), "utf8");
+    await ensurePrivateDataDir();
+    await writePrivateFile(sessionStorePath, JSON.stringify(Array.from(sessions.entries())));
   });
   return sessionWrite;
+}
+
+async function ensurePrivateDataDir() {
+  await fs.mkdir(privateDataDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await fs.chmod(privateDataDir, 0o700);
+}
+
+async function writePrivateFile(filePath, contents) {
+  await ensurePrivateDataDir();
+  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await fs.chmod(path.dirname(filePath), 0o700);
+  await fs.writeFile(filePath, contents, { encoding: "utf8", mode: 0o600 });
+  if (process.platform !== "win32") await fs.chmod(filePath, 0o600);
+}
+
+function saveAuthStore() {
+  authStoreWrite = authStoreWrite.catch(() => {}).then(async () => {
+    await writePrivateFile(authStorePath, JSON.stringify({
+      users: db.users,
+      invitations: db.invitations,
+      password_reset_tokens: passwordResetTokens
+    }));
+  });
+  return authStoreWrite;
+}
+
+function saveBusinessData() {
+  businessDataWrite = businessDataWrite.catch(() => {}).then(async () => {
+    const data = { ...db, users: undefined, invitations: undefined };
+    await writePrivateFile(businessDataPath, JSON.stringify(data));
+  });
+  return businessDataWrite;
+}
+
+async function loadPrivateData() {
+  await ensurePrivateDataDir();
+  try {
+    const savedBusinessData = JSON.parse(await fs.readFile(businessDataPath, "utf8"));
+    for (const [key, value] of Object.entries(savedBusinessData)) {
+      if (key !== "users" && key !== "invitations" && Object.prototype.hasOwnProperty.call(db, key)) {
+        db[key] = value;
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw new Error(`Could not load private business data: ${error.message}`);
+  }
+
+  try {
+    const savedAuthData = JSON.parse(await fs.readFile(authStorePath, "utf8"));
+    if (!Array.isArray(savedAuthData.users) || !Array.isArray(savedAuthData.invitations) ||
+      !Array.isArray(savedAuthData.password_reset_tokens)) {
+      throw new Error("Private account data has an invalid format.");
+    }
+    db.users = savedAuthData.users;
+    db.invitations = savedAuthData.invitations;
+    passwordResetTokens = savedAuthData.password_reset_tokens;
+    return;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw new Error(`Could not load private account data: ${error.message}`);
+  }
+
+  const initialPassword = crypto.randomBytes(24).toString("base64url");
+  db.users = [{
+    id: 1,
+    full_name: "Administrator",
+    email: String(process.env.DRAMAN_ADMIN_EMAIL || "admin@draman.co.ke").trim().toLowerCase(),
+    employee_id: "ADM-001",
+    phone: "",
+    role: "Super Admin",
+    status: "Active",
+    password_hash: await hashPassword(initialPassword),
+    created_at: todayIso()
+  }];
+  passwordResetTokens = [];
+  await saveAuthStore();
+  await writePrivateFile(
+    bootstrapCredentialsPath,
+    `Initial administrator sign-in\nEmail: ${db.users[0].email}\nPassword: ${initialPassword}\n\nChange this password and email after signing in. This file is stored outside the project folder and should be deleted after use.\n`
+  );
+  console.log(`Created the initial administrator account. Read credentials from: ${bootstrapCredentialsPath}`);
 }
 
 async function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -255,14 +307,26 @@ function nextCode(prefix, collection, field) {
 }
 
 function sendJson(response, status, data) {
-  response.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-  });
-  response.end(JSON.stringify(data));
+  const finish = (responseStatus, responseData) => {
+    response.writeHead(responseStatus, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS"
+    });
+    response.end(JSON.stringify(responseData));
+  };
+  if (response.persistData && status >= 200 && status < 300) {
+    saveBusinessData()
+      .then(() => finish(status, data))
+      .catch((error) => {
+        console.error("Could not save private business data:", error);
+        finish(500, { message: "Could not securely save the latest data. Check server storage permissions." });
+      });
+    return;
+  }
+  finish(status, data);
 }
 
 function isSuperAdminRequest(request) {
@@ -313,6 +377,15 @@ function buildNotifications(user) {
   const canSeeInventory = isAdmin || permissions.includes("inventory");
 
   if (isAdmin) {
+    const pendingAccounts = db.users.filter((item) => item.status === "Pending");
+    if (pendingAccounts.length) {
+      notifications.push({
+        id: "pending-accounts",
+        title: "Account requests",
+        message: `${pendingAccounts.length} account request${pendingAccounts.length === 1 ? "" : "s"} waiting for a role and approval.`,
+        level: "warning"
+      });
+    }
     const pendingLoans = db.loans.filter((loan) => loan.status === "Pending");
     if (pendingLoans.length) {
       notifications.push({
@@ -373,6 +446,51 @@ async function parseBody(request) {
   } catch (error) {
     return {};
   }
+}
+
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
+
+function resetTokenKey(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+async function sendPasswordResetInstructions(user, resetToken, resetRecord) {
+  const publicUrl = String(process.env.DRAMAN_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
+  const resetUrl = new URL("/", publicUrl);
+  resetUrl.searchParams.set("reset_token", resetToken);
+  const message = `Reset your DRAMAN account password using this one-time link. It expires in one hour:\n\n${resetUrl.toString()}\n`;
+  if (process.env.RESEND_API_KEY && process.env.DRAMAN_EMAIL_FROM) {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: process.env.DRAMAN_EMAIL_FROM,
+        to: [user.email],
+        subject: "Reset your DRAMAN account password",
+        text: message
+      })
+    });
+    if (!response.ok) throw new Error("The configured email provider could not send the reset message.");
+    return;
+  }
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("Password reset email delivery is not configured.");
+  }
+  const fileName = `reset-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`;
+  resetRecord.outbox_file = fileName;
+  await writePrivateFile(path.join(passwordResetOutboxPath, fileName), `To: ${user.email}\n\n${message}`);
+}
+
+async function revokeUserSessions(userId, exceptSessionKey = "") {
+  for (const [key, session] of sessions.entries()) {
+    if (session.user_id === userId && key !== exceptSessionKey) sessions.delete(key);
+  }
+  await saveSessions();
 }
 
 function publicCustomer(customerId) {
@@ -502,20 +620,90 @@ async function handleApi(request, response, pathname) {
     return;
   }
 
+  if (request.method === "POST" && pathname === "/api/password/forgot") {
+    const body = await parseBody(request);
+    const email = String(body.email || "").trim().toLowerCase();
+    const user = db.users.find((item) => item.email.toLowerCase() === email && item.status === "Active");
+    if (user) {
+      const token = crypto.randomBytes(32).toString("base64url");
+      const record = {
+        token_hash: resetTokenKey(token),
+        user_id: user.id,
+        expires_at: Date.now() + 60 * 60 * 1000,
+        outbox_file: ""
+      };
+      passwordResetTokens = passwordResetTokens.filter((item) => item.expires_at > Date.now());
+      passwordResetTokens.push(record);
+      try {
+        await sendPasswordResetInstructions(user, token, record);
+        await saveAuthStore();
+      } catch (error) {
+        passwordResetTokens = passwordResetTokens.filter((item) => item !== record);
+        await saveAuthStore();
+        console.error("Could not deliver password reset instructions:", error.message);
+        sendJson(response, 503, {
+          message: process.env.NODE_ENV === "production"
+            ? "Password reset email is temporarily unavailable. Contact your administrator."
+            : "Could not create password reset instructions. Check the private data folder permissions."
+        });
+        return;
+      }
+    }
+    sendJson(response, 200, { message: "If an active account uses that email, password reset instructions are available." });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/password/reset") {
+    const body = await parseBody(request);
+    const token = String(body.token || "");
+    const password = String(body.password || "");
+    const minimumPasswordLength = db.settings.security.minimum_password_length;
+    if (password.length < minimumPasswordLength || password.length > 128) {
+      sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
+      return;
+    }
+    const tokenHash = resetTokenKey(token);
+    const resetRecord = passwordResetTokens.find((item) => item.token_hash === tokenHash);
+    if (!resetRecord || resetRecord.expires_at <= Date.now()) {
+      passwordResetTokens = passwordResetTokens.filter((item) => item.expires_at > Date.now());
+      await saveAuthStore();
+      sendJson(response, 400, { message: "That password reset link is invalid or expired. Request a new one." });
+      return;
+    }
+    const user = db.users.find((item) => item.id === resetRecord.user_id && item.status === "Active");
+    if (!user) {
+      passwordResetTokens = passwordResetTokens.filter((item) => item !== resetRecord);
+      await saveAuthStore();
+      sendJson(response, 400, { message: "That password reset link is invalid or expired. Request a new one." });
+      return;
+    }
+    user.password_hash = await hashPassword(password);
+    passwordResetTokens = passwordResetTokens.filter((item) => item.user_id !== user.id);
+    if (resetRecord.outbox_file) {
+      try {
+        await fs.unlink(path.join(passwordResetOutboxPath, resetRecord.outbox_file));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+    await saveAuthStore();
+    await revokeUserSessions(user.id);
+    sendJson(response, 200, { message: "Password changed. Sign in with your new password." });
+    return;
+  }
+
   if (request.method === "POST" && pathname === "/api/login") {
     const body = await parseBody(request);
     const email = String(body.email || "").trim().toLowerCase();
-    const employeeId = String(body.employee_id || "").trim().toUpperCase();
-    const accountType = body.account_type === "admin" ? "admin" : body.account_type === "staff" ? "staff" : "";
-    const user = db.users.find((item) =>
-      item.email.toLowerCase() === email &&
-      item.status === "Active" &&
-      (accountType === "admin" ? item.role === "Super Admin" : accountType === "staff" && item.role !== "Super Admin") &&
-      (item.role === "Super Admin" || item.employee_id.toUpperCase() === employeeId)
-    );
-    const passwordValid = user ? await verifyPassword(String(body.password || ""), user.password_hash) : false;
+    const password = String(body.password || "");
+    const user = db.users.find((item) => item.email.toLowerCase() === email);
+    const passwordValid = user ? await verifyPassword(password, user.password_hash) : false;
     if (!user || !passwordValid) {
-      sendJson(response, 401, { message: "Check your account type, email, staff ID, and password, then try again." });
+      sendJson(response, 401, { message: "The email or password is incorrect." });
+      return;
+    }
+    if (user.status !== "Active") {
+      sendJson(response, 403, { message: "Your account is awaiting administrator approval." });
       return;
     }
     const token = crypto.randomBytes(32).toString("base64url");
@@ -524,6 +712,13 @@ async function handleApi(request, response, pathname) {
     sessions.set(key, { user_id: user.id, expires_at: expiresAt });
     try {
       await saveSessions();
+      if (user.role === "Super Admin") {
+        try {
+          await fs.unlink(bootstrapCredentialsPath);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
     } catch (error) {
       sessions.delete(key);
       throw error;
@@ -552,12 +747,12 @@ async function handleApi(request, response, pathname) {
     const password = String(body.password || "");
     const invitationCode = String(body.invitation_code || "").trim().toUpperCase();
 
-    if (fullName.length < 2 || fullName.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      sendJson(response, 400, { message: "Enter a valid full name and email address." });
+    if (fullName.length < 2 || fullName.length > 100 || !validEmail(email)) {
+      sendJson(response, 400, { message: "Enter a valid name and personal email address." });
       return;
     }
-    if (employeeId.length < 3 || employeeId.length > 32 || !/^[A-Z0-9-]+$/.test(employeeId)) {
-      sendJson(response, 400, { message: "Enter a staff ID containing at least 3 letters or numbers." });
+    if (employeeId && (employeeId.length < 3 || employeeId.length > 32 || !/^[A-Z0-9-]+$/.test(employeeId))) {
+      sendJson(response, 400, { message: "Staff IDs must contain 3 to 32 letters, numbers, or hyphens." });
       return;
     }
     const minimumPasswordLength = db.settings.security.minimum_password_length;
@@ -566,22 +761,26 @@ async function handleApi(request, response, pathname) {
       return;
     }
 
-    const codeHash = crypto.createHash("sha256").update(invitationCode).digest();
-    const invitation = db.invitations.find((item) => {
-      const expectedHash = Buffer.from(item.code_hash, "hex");
-      return !item.used_at && new Date(item.expires_at) > new Date() &&
-        expectedHash.length === codeHash.length && crypto.timingSafeEqual(expectedHash, codeHash);
-    });
-    if (!invitation) {
-      sendJson(response, 403, { message: "That invitation code is invalid, expired, or already used. Ask an admin for a new one." });
-      return;
+    let invitation = null;
+    if (invitationCode) {
+      const codeHash = crypto.createHash("sha256").update(invitationCode).digest();
+      invitation = db.invitations.find((item) => {
+        const expectedHash = Buffer.from(item.code_hash, "hex");
+        return !item.used_at && new Date(item.expires_at) > new Date() &&
+          expectedHash.length === codeHash.length && crypto.timingSafeEqual(expectedHash, codeHash);
+      });
+      if (!invitation) {
+        sendJson(response, 403, { message: "That invitation code is invalid, expired, or already used." });
+        return;
+      }
     }
     if (db.users.some((item) => item.email.toLowerCase() === email)) {
       sendJson(response, 409, { message: "An account already uses that email address." });
       return;
     }
-    if (db.settings.security.require_unique_staff_ids && db.users.some((item) => item.employee_id.toUpperCase() === employeeId)) {
-      sendJson(response, 409, { message: "That staff ID is already registered. Contact your admin if this is your ID." });
+    if (employeeId && db.settings.security.require_unique_staff_ids &&
+      db.users.some((item) => item.employee_id && item.employee_id.toUpperCase() === employeeId)) {
+      sendJson(response, 409, { message: "That staff ID is already registered." });
       return;
     }
 
@@ -591,23 +790,33 @@ async function handleApi(request, response, pathname) {
       email,
       employee_id: employeeId,
       phone: "",
-      role: invitation.role,
-      status: "Active",
+      role: invitation ? invitation.role : "Cashier",
+      status: invitation ? "Active" : "Pending",
       password_hash: await hashPassword(password),
       created_at: todayIso()
     };
     db.users.push(user);
-    invitation.used_at = todayIso();
-    invitation.used_by = user.id;
+    if (invitation) {
+      invitation.used_at = todayIso();
+      invitation.used_by = user.id;
+    }
+    await saveAuthStore();
     if (db.settings.security.audit_logging_enabled) {
       db.activity_logs.unshift({
         id: nextId(db.activity_logs),
-        user_id: invitation.created_by,
-        action: `${user.full_name} registered as ${user.role}`,
+        user_id: invitation ? invitation.created_by : user.id,
+        action: invitation
+          ? `${user.full_name} registered as ${user.role}`
+          : `${user.full_name} requested a team account`,
         created_at: todayIso()
       });
     }
-    sendJson(response, 201, { message: "Account created. You can now sign in.", user: publicUser(user) });
+    sendJson(response, 201, {
+      message: invitation
+        ? "Account created. Sign in with your personal email."
+        : "Account request submitted. An administrator must approve it before you can sign in.",
+      user: publicUser(user)
+    });
     return;
   }
 
@@ -635,6 +844,43 @@ async function handleApi(request, response, pathname) {
     return;
   }
 
+  if (request.method === "PUT" && pathname === "/api/account") {
+    const body = await parseBody(request);
+    const currentPassword = String(body.current_password || "");
+    const nextEmail = String(body.email || "").trim().toLowerCase();
+    const nextPassword = String(body.new_password || "");
+    if (!await verifyPassword(currentPassword, request.authUser.password_hash)) {
+      sendJson(response, 400, { message: "Current password is incorrect." });
+      return;
+    }
+    if (!validEmail(nextEmail)) {
+      sendJson(response, 400, { message: "Enter a valid email address." });
+      return;
+    }
+    if (db.users.some((user) => user.id !== request.authUser.id && user.email.toLowerCase() === nextEmail)) {
+      sendJson(response, 409, { message: "That email address is already associated with an account." });
+      return;
+    }
+    if (nextPassword) {
+      const minimumPasswordLength = db.settings.security.minimum_password_length;
+      if (nextPassword.length < minimumPasswordLength || nextPassword.length > 128) {
+        sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
+        return;
+      }
+    }
+
+    request.authUser.email = nextEmail;
+    if (nextPassword) request.authUser.password_hash = await hashPassword(nextPassword);
+    await saveAuthStore();
+    if (nextPassword) {
+      const authorization = request.headers.authorization || "";
+      const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+      await revokeUserSessions(request.authUser.id, sessionKey(token));
+    }
+    sendJson(response, 200, { user: publicUser(request.authUser) });
+    return;
+  }
+
   if (request.method === "GET" && pathname === "/api/settings") {
     sendJson(response, 200, db.settings);
     return;
@@ -654,7 +900,11 @@ async function handleApi(request, response, pathname) {
       application: "DRAMAN Loan Services Management System",
       created_at: createdAt,
       file_name: fileName,
-      data: JSON.parse(JSON.stringify(db))
+      data: {
+        ...JSON.parse(JSON.stringify(db)),
+        users: db.users.map(publicUser),
+        invitations: db.invitations.map(publicInvitation)
+      }
     });
     return;
   }
@@ -729,6 +979,37 @@ async function handleApi(request, response, pathname) {
     return;
   }
 
+  const teamApprovalMatch = pathname.match(/^\/api\/team\/(\d+)\/approve$/);
+  if (request.method === "POST" && teamApprovalMatch) {
+    if (!requireSuperAdmin(request, response)) return;
+    const body = await parseBody(request);
+    const role = String(body.role || "");
+    if (!allowedRoles.includes(role) || role === "Super Admin") {
+      sendJson(response, 400, { message: "Choose an approved staff role." });
+      return;
+    }
+    const member = db.users.find((user) => user.id === Number(teamApprovalMatch[1]));
+    if (!member) {
+      sendJson(response, 404, { message: "Account request not found." });
+      return;
+    }
+    if (member.status !== "Pending") {
+      sendJson(response, 409, { message: "Only pending account requests can be approved." });
+      return;
+    }
+    member.role = role;
+    member.status = "Active";
+    await saveAuthStore();
+    db.activity_logs.unshift({
+      id: nextId(db.activity_logs),
+      user_id: request.authUser.id,
+      action: `${member.full_name} approved as ${role}`,
+      created_at: todayIso()
+    });
+    sendJson(response, 200, { user: publicUser(member) });
+    return;
+  }
+
   if (request.method === "GET" && pathname === "/api/invitations") {
     if (!requireSuperAdmin(request, response)) return;
     const pending = db.invitations.filter((item) => !item.used_at && new Date(item.expires_at) > new Date());
@@ -763,6 +1044,7 @@ async function handleApi(request, response, pathname) {
       db.invitations.unshift(invitation);
       return { invitation: publicInvitation(invitation), code };
     });
+    await saveAuthStore();
     sendJson(response, 201, {
       invitations: createdInvitations,
       invitation: createdInvitations[0].invitation,
@@ -881,7 +1163,7 @@ async function handleApi(request, response, pathname) {
       start_date: body.start_date || dateOnly(new Date()),
       due_date: body.due_date || dateOnly(new Date()),
       status: loanRequiresApproval ? "Pending" : "Approved",
-      assigned_officer: body.assigned_officer || "Mercy Atieno",
+      assigned_officer: body.assigned_officer || "Unassigned",
       approved_by: loanRequiresApproval ? null : request.authUser.id,
       created_at: todayIso()
     };
@@ -1034,6 +1316,7 @@ const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
     if (url.pathname.startsWith("/api/")) {
+      response.persistData = ["POST", "PUT", "PATCH", "DELETE"].includes(request.method);
       await handleApi(request, response, url.pathname);
       return;
     }
@@ -1044,17 +1327,15 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-hashPassword("admin123")
-  .then(async (demoPasswordHash) => {
-    for (const user of db.users) {
-      user.password_hash = demoPasswordHash;
-    }
+loadPrivateData()
+  .then(async () => {
+    await saveBusinessData();
     await loadSessions();
     server.listen(PORT, () => {
       console.log(`DRAMAN Loan Services app running at http://localhost:${PORT}`);
     });
   })
   .catch((error) => {
-    console.error("Could not initialize demo accounts:", error);
+    console.error("Could not initialize private application data:", error);
     process.exitCode = 1;
   });

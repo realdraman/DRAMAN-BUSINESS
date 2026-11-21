@@ -363,10 +363,10 @@ function ThemeToggle({ theme, onToggle }) {
 }
 
 function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
-  const [mode, setMode] = useState("login");
-  const [accountType, setAccountType] = useState("admin");
-  const [role, setRole] = useState("Cashier");
-  const [credentials, setCredentials] = useState({ email: "", password: "", employee_id: "" });
+  const queryResetToken = new URLSearchParams(window.location.search).get("reset_token") || "";
+  const [mode, setMode] = useState(queryResetToken ? "reset" : "login");
+  const [resetToken] = useState(queryResetToken);
+  const [credentials, setCredentials] = useState({ email: "", password: "" });
   const [registration, setRegistration] = useState({
     full_name: "",
     email: "",
@@ -374,9 +374,16 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
     employee_id: "",
     invitation_code: ""
   });
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetPasswordConfirmation, setResetPasswordConfirmation] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState(initialMessage);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (queryResetToken) window.history.replaceState({}, "", window.location.pathname);
+  }, []);
 
   function changeMode(nextMode) {
     setMode(nextMode);
@@ -389,7 +396,7 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
     setLoading(true);
     setError("");
     try {
-      const { data } = await api.post("/api/login", { ...credentials, account_type: accountType });
+      const { data } = await api.post("/api/login", credentials);
       onLogin(data);
     } catch (requestError) {
       setError(requestError.message || "Unable to sign in");
@@ -404,13 +411,52 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
     setError("");
     setMessage("");
     try {
-      const { data } = await api.post("/api/register", { ...registration, role });
-      setCredentials({ email: registration.email, password: "", employee_id: registration.employee_id });
-      setAccountType(role === "Super Admin" ? "admin" : "staff");
+      const { data } = await api.post("/api/register", registration);
+      setCredentials({ email: registration.email, password: "" });
       setMode("login");
       setMessage(data.message);
     } catch (requestError) {
       setError(requestError.message || "Unable to create account");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitForgotPassword(event) {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    setMessage("");
+    try {
+      const { data } = await api.post("/api/password/forgot", { email: resetEmail });
+      setMessage(data.message);
+    } catch (requestError) {
+      setError(requestError.message || "Unable to start password reset.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitResetPassword(event) {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    setMessage("");
+    if (resetPassword !== resetPasswordConfirmation) {
+      setError("The new passwords do not match.");
+      setLoading(false);
+      return;
+    }
+    try {
+      const { data } = await api.post("/api/password/reset", { token: resetToken, password: resetPassword });
+      window.history.replaceState({}, "", window.location.pathname);
+      setMode("login");
+      setCredentials({ ...credentials, password: "" });
+      setResetPassword("");
+      setResetPasswordConfirmation("");
+      setMessage(data.message);
+    } catch (requestError) {
+      setError(requestError.message || "Unable to reset password.");
     } finally {
       setLoading(false);
     }
@@ -461,70 +507,81 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
             <form onSubmit={submitLogin}>
               <span className="auth-eyebrow">WELCOME BACK</span>
               <h2>Good to see you.</h2>
-              <p>Choose your account, then enter your sign-in details.</p>
-              <div className="auth-choice" aria-label="Choose account type">
-                <button className={accountType === "admin" ? "active" : ""} type="button" onClick={() => { setAccountType("admin"); setError(""); }}>
-                  <Icon name="shield-check" /><span>Administrator</span>
-                </button>
-                <button className={accountType === "staff" ? "active" : ""} type="button" onClick={() => { setAccountType("staff"); setError(""); }}>
-                  <Icon name="users" /><span>Team member</span>
-                </button>
-              </div>
+              <p>Sign in with the personal email and password on your account.</p>
               <div className="form-grid single auth-fields">
-                <Field label="Work email">
+                <Field label="Email">
                   <input type="email" value={credentials.email} onChange={(event) => setCredentials({ ...credentials, email: event.target.value })} autoComplete="username" required />
                 </Field>
-                {accountType === "staff" ? (
-                  <Field label="Unique staff ID">
-                    <input value={credentials.employee_id} onChange={(event) => setCredentials({ ...credentials, employee_id: event.target.value })} autoComplete="username" placeholder="e.g. CASH-014" required />
-                  </Field>
-                ) : null}
                 <Field label="Password">
                   <input type="password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} autoComplete="current-password" required />
                 </Field>
               </div>
-              {accountType === "staff" ? (
-                <div className="auth-note"><Icon name="key-round" /> Your staff ID is assigned by your administrator when your account is created.</div>
-              ) : null}
               <button className="primary-button auth-submit" type="submit" disabled={loading}>
                 <Icon name="arrow-right" />{loading ? "Signing in..." : "Sign in securely"}
               </button>
+              <button className="auth-text-button" type="button" onClick={() => changeMode("forgot")}>Forgot your password?</button>
               <div className="auth-footnote"><Icon name="lock-keyhole" /> Your workspace is protected by role-based access.</div>
             </form>
-          ) : (
+          ) : mode === "register" ? (
             <form onSubmit={submitRegistration}>
-              <span className="auth-eyebrow">INVITATION REQUIRED</span>
+              <span className="auth-eyebrow">CREATE YOUR ACCOUNT</span>
               <h2>Join the team.</h2>
-              <p>Ask an administrator for a role-specific invitation code before creating your account.</p>
+              <p>Use your personal email. An administrator must approve uninvited account requests.</p>
               <div className="form-grid single auth-fields">
-                <Field label="Account role">
-                  <select value={role} onChange={(event) => setRole(event.target.value)}>
-                    <option value="Cashier">Cashier</option>
-                    <option value="Loan Officer">Loan Officer</option>
-                    <option value="Inventory Manager">Inventory Manager</option>
-                    <option value="Super Admin">Administrator</option>
-                  </select>
-                </Field>
                 <Field label="Full name">
                   <input value={registration.full_name} onChange={(event) => setRegistration({ ...registration, full_name: event.target.value })} autoComplete="name" minLength="2" maxLength="100" required />
                 </Field>
-                <Field label="Unique staff ID">
-                  <input value={registration.employee_id} onChange={(event) => setRegistration({ ...registration, employee_id: event.target.value })} placeholder="Provided by your administrator" maxLength="32" required />
-                </Field>
-                <Field label="Work email">
+                <Field label="Personal email">
                   <input type="email" value={registration.email} onChange={(event) => setRegistration({ ...registration, email: event.target.value })} autoComplete="email" required />
+                </Field>
+                <Field label="Staff ID (optional)">
+                  <input value={registration.employee_id} onChange={(event) => setRegistration({ ...registration, employee_id: event.target.value })} placeholder="May be assigned later" maxLength="32" />
                 </Field>
                 <Field label="Create password">
                   <input type="password" value={registration.password} onChange={(event) => setRegistration({ ...registration, password: event.target.value })} autoComplete="new-password" minLength="10" required />
                 </Field>
-                <Field label="Admin invitation code">
-                  <input value={registration.invitation_code} onChange={(event) => setRegistration({ ...registration, invitation_code: event.target.value })} placeholder="DRM-..." autoComplete="off" required />
+                <Field label="Invitation code (optional)">
+                  <input value={registration.invitation_code} onChange={(event) => setRegistration({ ...registration, invitation_code: event.target.value })} placeholder="DRM-..." autoComplete="off" />
                 </Field>
               </div>
-              <div className="auth-note"><Icon name="shield-check" /> Codes are single-use, role-specific and expire after 24 hours. Admin accounts also require an invitation from an existing admin.</div>
+              <div className="auth-note"><Icon name="shield-check" /> Uninvited accounts stay pending until an administrator assigns a role and approves them.</div>
               <button className="primary-button auth-submit" type="submit" disabled={loading}>
                 <Icon name="user-round-plus" />{loading ? "Creating account..." : "Create account"}
               </button>
+            </form>
+          ) : mode === "forgot" ? (
+            <form onSubmit={submitForgotPassword}>
+              <span className="auth-eyebrow">ACCOUNT RECOVERY</span>
+              <h2>Reset your password.</h2>
+              <p>Enter your account email. If it is registered, reset instructions will be provided.</p>
+              <div className="form-grid single auth-fields">
+                <Field label="Email">
+                  <input type="email" value={resetEmail} onChange={(event) => setResetEmail(event.target.value)} autoComplete="email" required />
+                </Field>
+              </div>
+              <div className="auth-note"><Icon name="lock-keyhole" /> In local development, reset links are written to the private data folder when email delivery is not configured.</div>
+              <button className="primary-button auth-submit" type="submit" disabled={loading}>
+                <Icon name="mail" />{loading ? "Sending..." : "Send reset instructions"}
+              </button>
+              <button className="auth-text-button" type="button" onClick={() => changeMode("login")}>Back to sign in</button>
+            </form>
+          ) : (
+            <form onSubmit={submitResetPassword}>
+              <span className="auth-eyebrow">ACCOUNT RECOVERY</span>
+              <h2>Choose a new password.</h2>
+              <p>Reset links expire after one hour and can only be used once.</p>
+              <div className="form-grid single auth-fields">
+                <Field label="New password">
+                  <input type="password" value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} autoComplete="new-password" minLength="10" required />
+                </Field>
+                <Field label="Confirm new password">
+                  <input type="password" value={resetPasswordConfirmation} onChange={(event) => setResetPasswordConfirmation(event.target.value)} autoComplete="new-password" minLength="10" required />
+                </Field>
+              </div>
+              <button className="primary-button auth-submit" type="submit" disabled={loading || !resetToken}>
+                <Icon name="key-round" />{loading ? "Updating..." : "Reset password"}
+              </button>
+              {!resetToken ? <div className="error-box" role="alert">This reset link is missing its token. Request another link.</div> : null}
             </form>
           )}
           {error ? <div className="error-box" role="alert">{error}</div> : null}
@@ -574,7 +631,84 @@ function Sidebar({ activeView, setActiveView, user, permissions }) {
   );
 }
 
-function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme }) {
+function AccountSettings({ user, onAccountUpdated }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [email, setEmail] = useState(user.email || "");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const { data } = await api.put("/api/account", {
+        email,
+        current_password: currentPassword,
+        new_password: newPassword
+      });
+      onAccountUpdated(data.user);
+      setCurrentPassword("");
+      setNewPassword("");
+      setMessage("Account details updated.");
+    } catch (requestError) {
+      setError(requestError.message || "Unable to update account details.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <button className="ghost-button" type="button" onClick={() => { setIsOpen(true); setEmail(user.email || ""); setError(""); setMessage(""); }}>
+        <Icon name="user-round-cog" />My account
+      </button>
+      {isOpen ? (
+        <div className="account-modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setIsOpen(false);
+        }}>
+          <section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+            <div className="account-modal__header">
+              <div>
+                <span className="auth-eyebrow">PERSONAL ACCOUNT</span>
+                <h2 id="account-modal-title">Change email or password</h2>
+              </div>
+              <button className="icon-button" type="button" aria-label="Close account settings" onClick={() => setIsOpen(false)}>
+                <Icon name="x" />
+              </button>
+            </div>
+            <form className="account-modal__form" onSubmit={submit}>
+              <Field label="Personal email">
+                <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required />
+              </Field>
+              <Field label="Current password">
+                <input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required />
+              </Field>
+              <Field label="New password (leave blank to keep current)">
+                <input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength="10" />
+              </Field>
+              <div className="compact muted">Your current password is required to save account changes.</div>
+              {error ? <div className="error-box" role="alert">{error}</div> : null}
+              {message ? <div className="success-box" role="status">{message}</div> : null}
+              <div className="button-row">
+                <button className="primary-button" type="submit" disabled={saving}>
+                  <Icon name="save" />{saving ? "Saving..." : "Save account changes"}
+                </button>
+                <button className="ghost-button" type="button" onClick={() => setIsOpen(false)}>Close</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme, onAccountUpdated }) {
   return (
     <header className="topbar">
       <div className="search-field">
@@ -589,6 +723,7 @@ function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme }) {
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <NotificationCenter />
         <SystemBackup isAdmin={user.role === "Super Admin"} />
+        <AccountSettings user={user} onAccountUpdated={onAccountUpdated} />
         <div className="text-right">
           <div className="topbar-user-name font-bold leading-tight">{user.full_name}</div>
           <div className="compact muted">{user.role}</div>
@@ -2071,6 +2206,8 @@ function TeamAccess() {
   const [team, setTeam] = useState([]);
   const [invitations, setInvitations] = useState([]);
   const [issuedCodes, setIssuedCodes] = useState([]);
+  const [approvalRoles, setApprovalRoles] = useState({});
+  const [approvingId, setApprovingId] = useState(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -2115,11 +2252,28 @@ function TeamAccess() {
     }
   }
 
+  async function approveAccount(memberId) {
+    setApprovingId(memberId);
+    setError("");
+    setMessage("");
+    try {
+      const { data } = await api.post(`/api/team/${memberId}/approve`, {
+        role: approvalRoles[memberId] || "Cashier"
+      });
+      setMessage(`${data.user.full_name} approved as ${data.user.role}.`);
+      await refreshAccess();
+    } catch (requestError) {
+      setError(requestError.message || "Unable to approve account.");
+    } finally {
+      setApprovingId(null);
+    }
+  }
+
   return (
     <>
       <SectionHeading
         title="Team Access"
-        description="Invite staff and administrators with single-use codes, and review the unique IDs used to sign in."
+        description="Invite staff, approve account requests, and manage role-based access."
       />
       <section className="team-access-layout">
         <div className="panel">
@@ -2188,19 +2342,37 @@ function TeamAccess() {
           <div className="panel-body table-wrap">
             <table className="data-table">
               <thead>
-                <tr><th>Name</th><th>Unique ID</th><th>Email</th><th>Role</th><th>Status</th></tr>
+                <tr><th>Name</th><th>Staff ID</th><th>Email</th><th>Role</th><th>Status</th><th>Action</th></tr>
               </thead>
               <tbody>
                 {team.map((member) => (
                   <tr key={member.id}>
                     <td><strong>{member.full_name}</strong></td>
-                    <td><span className="team-id">{member.employee_id}</span></td>
+                    <td><span className="team-id">{member.employee_id || "Not assigned"}</span></td>
                     <td>{member.email}</td>
                     <td>{member.role === "Super Admin" ? "Administrator" : member.role}</td>
                     <td><Badge tone={member.status}>{member.status}</Badge></td>
+                    <td>
+                      {member.status === "Pending" ? (
+                        <div className="team-approval-actions">
+                          <select
+                            aria-label={`Role for ${member.full_name}`}
+                            value={approvalRoles[member.id] || "Cashier"}
+                            onChange={(event) => setApprovalRoles({ ...approvalRoles, [member.id]: event.target.value })}
+                          >
+                            <option value="Cashier">Cashier</option>
+                            <option value="Loan Officer">Loan Officer</option>
+                            <option value="Inventory Manager">Inventory Manager</option>
+                          </select>
+                          <button className="primary-button" type="button" disabled={approvingId === member.id} onClick={() => approveAccount(member.id)}>
+                            {approvingId === member.id ? "Approving..." : "Approve"}
+                          </button>
+                        </div>
+                      ) : <span className="compact muted">—</span>}
+                    </td>
                   </tr>
                 ))}
-                {!team.length ? <tr><td colSpan="5">No team accounts found.</td></tr> : null}
+                {!team.length ? <tr><td colSpan="6">No team accounts found.</td></tr> : null}
               </tbody>
             </table>
           </div>
@@ -2284,7 +2456,7 @@ function SettingsPanel({ title, icon, section, values, fields, onChange, onSave,
   );
 }
 
-function AppShell({ session, onLogout, theme, onToggleTheme }) {
+function AppShell({ session, onLogout, onAccountUpdated, theme, onToggleTheme }) {
   const [activeView, setActiveView] = useState("dashboard");
   const [search, setSearch] = useState("");
   const [summary, setSummary] = useState(null);
@@ -2350,7 +2522,7 @@ function AppShell({ session, onLogout, theme, onToggleTheme }) {
     <div className="app-shell">
       <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} />
       <div className="workspace">
-        <Topbar user={session.user} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} />
+        <Topbar user={session.user} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} onAccountUpdated={onAccountUpdated} />
         <main className="main-content">
           {activeView === "dashboard" ? <Dashboard {...viewProps} /> : null}
           {activeView === "customers" ? <CustomerManagement {...viewProps} /> : null}
@@ -2447,6 +2619,13 @@ function App() {
     setSession(nextSession);
   }
 
+  function handleAccountUpdated(user) {
+    if (!session) return;
+    const updatedSession = { ...session, user };
+    window.sessionStorage.setItem("draman-session", JSON.stringify(updatedSession));
+    setSession(updatedSession);
+  }
+
   async function handleLogout() {
     try {
       await api.post("/api/logout", {});
@@ -2468,7 +2647,7 @@ function App() {
     return <LoginScreen onLogin={handleLogin} theme={theme} onToggleTheme={toggleTheme} initialMessage={authNotice} />;
   }
 
-  return <AppShell session={session} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />;
+  return <AppShell session={session} onLogout={handleLogout} onAccountUpdated={handleAccountUpdated} theme={theme} onToggleTheme={toggleTheme} />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);

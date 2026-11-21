@@ -847,6 +847,21 @@ button {
   background: #e8bb5d;
 }
 
+.auth-text-button {
+  display: block;
+  margin: 14px auto 0;
+  border: 0;
+  color: var(--harbor);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.auth-text-button:hover {
+  text-decoration: underline;
+}
+
 .auth-note {
   display: flex;
   align-items: flex-start;
@@ -876,6 +891,64 @@ button {
   margin-top: 18px;
   color: var(--muted);
   font-size: 11px;
+}
+
+.account-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(5, 16, 31, 0.62);
+}
+
+.account-modal {
+  width: min(100%, 520px);
+  max-height: min(90vh, 760px);
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  box-shadow: 0 24px 80px rgba(5, 16, 31, 0.28);
+}
+
+.account-modal__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.account-modal__header h2 {
+  margin: 6px 0 0;
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: 22px;
+}
+
+.account-modal__form {
+  display: grid;
+  gap: 14px;
+}
+
+.team-approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 230px;
+}
+
+.team-approval-actions select {
+  min-width: 140px;
+}
+
+.team-approval-actions .primary-button {
+  min-height: 36px;
+  padding: 7px 10px;
+  white-space: nowrap;
 }
 
 .auth-footnote .icon {
