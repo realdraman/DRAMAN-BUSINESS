@@ -7,6 +7,12 @@ const { promisify } = require("node:util");
 const os = require("node:os");
 
 const PORT = Number(process.env.PORT || 4173);
+const isProduction = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+const sessionSecret = process.env.SESSION_SECRET || (isProduction ? "" : crypto.randomBytes(32).toString("base64url"));
+if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
+  throw new Error("Set SESSION_SECRET to a secret of at least 32 bytes before starting in production.");
+}
+const sessionCookieName = "draman_session";
 const scrypt = promisify(crypto.scrypt);
 const defaultDataDir = process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "DRAMAN Loan Services")
@@ -16,7 +22,6 @@ const defaultDataDir = process.env.LOCALAPPDATA
 const privateDataDir = path.resolve(
   process.env.DRAMAN_DATA_DIR || (process.env.VERCEL ? "/tmp/private-data" : defaultDataDir)
 );
-const sessionStorePath = path.join(privateDataDir, "sessions.json");
 const authStorePath = path.join(privateDataDir, "auth-store.json");
 const adminCredentialsPath = path.join(privateDataDir, "admin-credentials.json");
 const businessDataPath = path.join(privateDataDir, "business-data.json");
@@ -144,40 +149,10 @@ const db = {
 };
 
 const allowedRoles = ["Super Admin", "Cashier", "Loan Officer", "Inventory Manager"];
-const sessions = new Map();
-let sessionWrite = Promise.resolve();
 let authStoreWrite = Promise.resolve();
 let businessDataWrite = Promise.resolve();
 let passwordResetTokens = [];
 db.invitations = [];
-
-function sessionKey(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-async function loadSessions() {
-  try {
-    const stored = JSON.parse(await fs.readFile(sessionStorePath, "utf8"));
-    if (!Array.isArray(stored)) throw new Error("Session store must contain a list.");
-    stored.forEach(([key, session]) => {
-      if (/^[a-f0-9]{64}$/.test(key) && Number.isInteger(session.user_id) &&
-        Number.isFinite(session.expires_at) && session.expires_at > Date.now()) {
-        sessions.set(key, session);
-      }
-    });
-  } catch (error) {
-    if (error.code === "ENOENT") return;
-    throw new Error(`Could not load saved sessions: ${error.message}`);
-  }
-}
-
-function saveSessions() {
-  sessionWrite = sessionWrite.catch(() => {}).then(async () => {
-    await ensurePrivateDataDir();
-    await writePrivateFile(sessionStorePath, JSON.stringify(Array.from(sessions.entries())));
-  });
-  return sessionWrite;
-}
 
 async function ensurePrivateDataDir() {
   await fs.mkdir(privateDataDir, { recursive: true, mode: 0o700 });
@@ -268,6 +243,7 @@ async function loadPrivateData() {
     phone: "",
     role: "Super Admin",
     status: "Active",
+    session_version: 0,
     password_hash: await hashPassword(initialPassword),
     created_at: todayIso()
   }];
@@ -303,7 +279,7 @@ async function verifyPassword(password, storedHash) {
 }
 
 function publicUser(user) {
-  const { password_hash, ...safeUser } = user;
+  const { password_hash, session_version, ...safeUser } = user;
   return safeUser;
 }
 
@@ -312,19 +288,67 @@ function publicInvitation(invitation) {
   return safeInvitation;
 }
 
-function sessionUser(request) {
-  const authorization = request.headers.authorization || "";
-  const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  const key = sessionKey(token);
-  const session = sessions.get(key);
-  if (!session) return null;
-  if (session.expires_at <= Date.now()) {
-    sessions.delete(key);
+function readCookie(request, name) {
+  const cookieHeader = request.headers.cookie || "";
+  for (const pair of cookieHeader.split(";")) {
+    const separator = pair.indexOf("=");
+    if (separator < 0) continue;
+    if (pair.slice(0, separator).trim() === name) return pair.slice(separator + 1).trim();
+  }
+  return "";
+}
+
+function signSession(user, expiresAt) {
+  const payload = Buffer.from(JSON.stringify({
+    user_id: user.id,
+    expires_at: expiresAt,
+    session_version: Number.isSafeInteger(user.session_version) ? user.session_version : 0
+  })).toString("base64url");
+  const signature = crypto.createHmac("sha256", sessionSecret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function verifySession(token) {
+  const parts = token.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const [payload, signature] = parts;
+  const expected = crypto.createHmac("sha256", sessionSecret).update(payload).digest();
+  const received = Buffer.from(signature, "base64url");
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!Number.isSafeInteger(session.user_id) || !Number.isSafeInteger(session.expires_at) ||
+      !Number.isSafeInteger(session.session_version)) return null;
+    return session;
+  } catch (error) {
     return null;
   }
-  const userId = session.user_id;
-  const user = db.users.find((item) => item.id === userId && item.status === "Active");
-  if (user) request.authUser = user;
+}
+
+function sessionCookie(value, expiresAt) {
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  const secure = isProduction ? "; Secure" : "";
+  return `${sessionCookieName}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}; Expires=${new Date(expiresAt).toUTCString()}${secure}`;
+}
+
+function clearSessionCookie() {
+  const secure = isProduction ? "; Secure" : "";
+  return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure}`;
+}
+
+function expireUserSessions(user) {
+  user.session_version = (Number.isSafeInteger(user.session_version) ? user.session_version : 0) + 1;
+}
+
+function sessionUser(request) {
+  const token = readCookie(request, sessionCookieName);
+  const session = verifySession(token);
+  if (!session || session.expires_at <= Date.now()) return null;
+  const user = db.users.find((item) => item.id === session.user_id && item.status === "Active");
+  const currentVersion = user && Number.isSafeInteger(user.session_version) ? user.session_version : 0;
+  if (!user || session.session_version !== currentVersion) return null;
+  request.authUser = user;
+  request.sessionExpiresAt = session.expires_at;
   return user;
 }
 
@@ -340,13 +364,15 @@ function nextCode(prefix, collection, field) {
 
 function sendJson(response, status, data) {
   const finish = (responseStatus, responseData) => {
-    response.writeHead(responseStatus, {
+    const headers = {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type",
       "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS"
-    });
+    };
+    if (response.sessionCookie) headers["Set-Cookie"] = response.sessionCookie;
+    response.writeHead(responseStatus, headers);
     response.end(JSON.stringify(responseData));
   };
   if (response.persistData && status >= 200 && status < 300) {
@@ -516,13 +542,6 @@ async function sendPasswordResetInstructions(user, resetToken, resetRecord) {
   const fileName = `reset-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`;
   resetRecord.outbox_file = fileName;
   await writePrivateFile(path.join(passwordResetOutboxPath, fileName), `To: ${user.email}\n\n${message}`);
-}
-
-async function revokeUserSessions(userId, exceptSessionKey = "") {
-  for (const [key, session] of sessions.entries()) {
-    if (session.user_id === userId && key !== exceptSessionKey) sessions.delete(key);
-  }
-  await saveSessions();
 }
 
 function publicCustomer(customerId) {
@@ -710,6 +729,7 @@ async function handleApi(request, response, pathname) {
       return;
     }
     user.password_hash = await hashPassword(password);
+    expireUserSessions(user);
     passwordResetTokens = passwordResetTokens.filter((item) => item.user_id !== user.id);
     if (resetRecord.outbox_file) {
       try {
@@ -719,7 +739,6 @@ async function handleApi(request, response, pathname) {
       }
     }
     await saveAuthStore();
-    await revokeUserSessions(user.id);
     sendJson(response, 200, { message: "Password changed. Sign in with your new password." });
     return;
   }
@@ -738,23 +757,15 @@ async function handleApi(request, response, pathname) {
       sendJson(response, 403, { message: "Your account is awaiting administrator approval." });
       return;
     }
-    const token = crypto.randomBytes(32).toString("base64url");
     const expiresAt = Date.now() + db.settings.security.session_timeout_hours * 60 * 60 * 1000;
-    const key = sessionKey(token);
-    sessions.set(key, { user_id: user.id, expires_at: expiresAt });
-    try {
-      await saveSessions();
-      if (user.role === "Super Admin") {
-        try {
-          await fs.unlink(bootstrapCredentialsPath);
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
+    if (user.role === "Super Admin") {
+      try {
+        await fs.unlink(bootstrapCredentialsPath);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
       }
-    } catch (error) {
-      sessions.delete(key);
-      throw error;
     }
+    response.sessionCookie = sessionCookie(signSession(user, expiresAt), expiresAt);
     if (db.settings.security.audit_logging_enabled) {
       db.activity_logs.unshift({
         id: nextId(db.activity_logs),
@@ -764,7 +775,6 @@ async function handleApi(request, response, pathname) {
       });
     }
     sendJson(response, 200, {
-      token,
       expires_at: new Date(expiresAt).toISOString(),
       user: publicUser(user)
     });
@@ -824,6 +834,7 @@ async function handleApi(request, response, pathname) {
       phone: "",
       role: invitation ? invitation.role : "Cashier",
       status: invitation ? "Active" : "Pending",
+      session_version: 0,
       password_hash: await hashPassword(password),
       created_at: todayIso()
     };
@@ -853,25 +864,26 @@ async function handleApi(request, response, pathname) {
   }
 
   if (request.method === "POST" && pathname === "/api/logout") {
-    const authorization = request.headers.authorization || "";
-    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-    sessions.delete(sessionKey(token));
-    await saveSessions();
+    const user = sessionUser(request);
+    if (user) {
+      expireUserSessions(user);
+      await saveAuthStore();
+    }
+    response.sessionCookie = clearSessionCookie();
     sendJson(response, 200, { message: "Signed out" });
     return;
   }
 
   if (!sessionUser(request)) {
+    response.sessionCookie = clearSessionCookie();
     sendJson(response, 401, { message: "Your session has expired. Please sign in again." });
     return;
   }
 
   if (request.method === "GET" && pathname === "/api/session") {
-    const authorization = request.headers.authorization || "";
-    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     sendJson(response, 200, {
       user: publicUser(request.authUser),
-      expires_at: new Date(sessions.get(sessionKey(token)).expires_at).toISOString()
+      expires_at: new Date(request.sessionExpiresAt).toISOString()
     });
     return;
   }
@@ -902,12 +914,16 @@ async function handleApi(request, response, pathname) {
     }
 
     request.authUser.email = nextEmail;
-    if (nextPassword) request.authUser.password_hash = await hashPassword(nextPassword);
+    if (nextPassword) {
+      request.authUser.password_hash = await hashPassword(nextPassword);
+      expireUserSessions(request.authUser);
+    }
     await saveAuthStore();
     if (nextPassword) {
-      const authorization = request.headers.authorization || "";
-      const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-      await revokeUserSessions(request.authUser.id, sessionKey(token));
+      response.sessionCookie = sessionCookie(
+        signSession(request.authUser, request.sessionExpiresAt),
+        request.sessionExpiresAt
+      );
     }
     sendJson(response, 200, { user: publicUser(request.authUser) });
     return;
@@ -1347,7 +1363,6 @@ async function handleApi(request, response, pathname) {
 const initialization = loadPrivateData()
   .then(async () => {
     await saveBusinessData();
-    await loadSessions();
     return null;
   })
   .catch((error) => {

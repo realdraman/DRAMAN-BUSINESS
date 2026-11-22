@@ -14,16 +14,6 @@ function handleApiResponseError(response, data) {
 }
 
 const api = {
-  authHeaders() {
-    try {
-      const savedSession = window.sessionStorage.getItem("draman-session");
-      const token = savedSession ? JSON.parse(savedSession).token : "";
-      return token ? { Authorization: `Bearer ${token}` } : {};
-    } catch (error) {
-      console.error("Could not read the saved session:", error);
-      return {};
-    }
-  },
   handleUnauthorized() {
     if (!window.sessionStorage.getItem("draman-session")) return;
     window.sessionStorage.removeItem("draman-session");
@@ -32,12 +22,12 @@ const api = {
   async get(url) {
     if (window.axios) {
       try {
-        return await window.axios.get(url, { headers: this.authHeaders() });
+        return await window.axios.get(url, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
-    const response = await fetch(url, { headers: this.authHeaders() });
+    const response = await fetch(url, { credentials: "same-origin" });
     const data = await response.json();
     if (!response.ok) handleApiResponseError(response, data);
     return { data };
@@ -45,14 +35,15 @@ const api = {
   async post(url, payload) {
     if (window.axios) {
       try {
-        return await window.axios.post(url, payload, { headers: this.authHeaders() });
+        return await window.axios.post(url, payload, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...this.authHeaders() },
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
     const data = await response.json();
@@ -62,14 +53,15 @@ const api = {
   async put(url, payload) {
     if (window.axios) {
       try {
-        return await window.axios.put(url, payload, { headers: this.authHeaders() });
+        return await window.axios.put(url, payload, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
     const response = await fetch(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", ...this.authHeaders() },
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
     const data = await response.json();
@@ -79,14 +71,14 @@ const api = {
   async delete(url) {
     if (window.axios) {
       try {
-        return await window.axios.delete(url, { headers: this.authHeaders() });
+        return await window.axios.delete(url, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
     const response = await fetch(url, {
       method: "DELETE",
-      headers: this.authHeaders()
+      credentials: "same-origin"
     });
     const data = await response.json();
     if (!response.ok) handleApiResponseError(response, data);
@@ -2545,7 +2537,8 @@ function App() {
     if (!saved) return null;
     try {
       const restored = JSON.parse(saved);
-      return restored.expires_at && new Date(restored.expires_at).getTime() <= Date.now() ? null : restored;
+      if (!restored.expires_at || new Date(restored.expires_at).getTime() <= Date.now()) return null;
+      return { user: restored.user, expires_at: restored.expires_at };
     } catch (error) {
       console.error("Could not restore the saved session:", error);
       return null;
@@ -2570,22 +2563,21 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!session) {
-      setSessionReady(true);
-      return undefined;
-    }
     let active = true;
+    const hadSavedSession = Boolean(window.sessionStorage.getItem("draman-session"));
     api.get("/api/session")
       .then(({ data }) => {
         if (!active) return;
-        const restoredSession = { ...session, user: data.user, expires_at: data.expires_at };
+        const restoredSession = { user: data.user, expires_at: data.expires_at };
         window.sessionStorage.setItem("draman-session", JSON.stringify(restoredSession));
         setSession(restoredSession);
       })
       .catch(() => {
         if (!active) return;
         window.sessionStorage.removeItem("draman-session");
-        setAuthNotice("Your session expired or the server restarted. Sign in again to continue.");
+        if (hadSavedSession) {
+          setAuthNotice("Your session expired or the server restarted. Sign in again to continue.");
+        }
         setSession(null);
       })
       .finally(() => {
@@ -2614,14 +2606,15 @@ function App() {
   }, [session]);
 
   function handleLogin(nextSession) {
-    window.sessionStorage.setItem("draman-session", JSON.stringify(nextSession));
+    const savedSession = { user: nextSession.user, expires_at: nextSession.expires_at };
+    window.sessionStorage.setItem("draman-session", JSON.stringify(savedSession));
     setAuthNotice("");
-    setSession(nextSession);
+    setSession(savedSession);
   }
 
   function handleAccountUpdated(user) {
     if (!session) return;
-    const updatedSession = { ...session, user };
+    const updatedSession = { user, expires_at: session.expires_at };
     window.sessionStorage.setItem("draman-session", JSON.stringify(updatedSession));
     setSession(updatedSession);
   }
