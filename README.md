@@ -16,13 +16,13 @@ Starter implementation for the DRAMAN Loan Services Management System blueprint.
 - Payment recording form with automatic balance update
 - Inventory, reports, agreements, and settings screens
 - Editable business, loan, security, and staff-menu settings; work-in-progress customer, loan, payment, and product forms resume when switching screens in the same browser tab
-- PostgreSQL-backed customer, loan, payment, sales, inventory, branch, dashboard, agreement, and settings routes
+- PostgreSQL-backed customer, loan, payment, sales, inventory, branch, dashboard, backup, agreement, and settings routes
 - Single-use password-reset tokens with bcrypt password updates and session invalidation
-- PostgreSQL schema and operator-provisioned platform and tenant administrators
+- PostgreSQL schema, startup-provisioned Super Admin, and operator-provisioned tenant administrator
 
 ## Run Locally
 
-Install dependencies and configure `DATABASE_URL` and a stable `SESSION_SECRET` of at least 32 bytes. Configure password-reset email delivery using an HTTPS `PASSWORD_RESET_EMAIL_WEBHOOK_URL`, its `PASSWORD_RESET_EMAIL_WEBHOOK_SECRET`, and the HTTPS public origin in `PUBLIC_APP_URL`. The webhook must accept a bearer-authenticated JSON request containing `to`, `subject`, `reset_url`, and `expires_in_minutes`, then deliver the link without logging it. Apply `schema.sql` and `seed.sql` using the secure provisioning steps below; the server does not run schema migrations automatically.
+Install dependencies and configure `DATABASE_URL` and a stable `SESSION_SECRET` of at least 32 bytes. Set `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD` to provision an active Super Admin automatically when the server starts and no Super Admin exists. The bootstrap password must be 10 to 128 characters. Keep both values in the deployment secret store. Configure password-reset email delivery using an HTTPS `PASSWORD_RESET_EMAIL_WEBHOOK_URL`, its `PASSWORD_RESET_EMAIL_WEBHOOK_SECRET`, and the HTTPS public origin in `PUBLIC_APP_URL`. The webhook must accept a bearer-authenticated JSON request containing `to`, `subject`, `reset_url`, and `expires_in_minutes`, then deliver the link without logging it. Apply `schema.sql` and `seed.sql` using the secure provisioning steps below; the server does not run schema migrations automatically.
 
 ```powershell
 npm start
@@ -42,11 +42,11 @@ npm test
 
 ## Deploy on Vercel
 
-`vercel.json` includes the HTML, JSX, CSS, and logo files in the server function bundle. Configure `DATABASE_URL` and `SESSION_SECRET` in the deployment environment. The database connection is provided by `db.js`; no filesystem-backed application state is used.
+`vercel.json` includes the HTML, JSX, CSS, and logo files in the server function bundle. Configure `DATABASE_URL` and `SESSION_SECRET` in Vercel. Configure `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD` there if the database does not already contain a Super Admin; the first server start creates an active account using bcryptjs and never changes an existing account's password. The connection pool is provided by `db.js`; application data and system backups use PostgreSQL, while the filesystem is used only to serve static app files.
 
 ## Secure Initial Provisioning
 
-The seed creates one platform administrator and the first tenant administrator. Their login identifiers are `platform-admin@draman.local` and `admin@draman.local`. Passwords are never stored in this repository or echoed by the prompts; `seed.sql` requires two distinct operator-supplied passwords (at least 16 characters, upper- and lowercase letters, a number, and a symbol) and hashes them with PostgreSQL `pgcrypto` bcrypt before insertion. Do not put passwords in shell arguments, SQL files, environment files committed to source control, or terminal transcripts.
+The seed creates the first tenant administrator with login `admin@draman.local`. If no Super Admin exists, it also creates a fallback platform administrator at `platform-admin@draman.local`. You may instead use the `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD` startup bootstrap; in that case the seed detects the existing Super Admin and does not create a second one. Seed passwords are never stored in this repository or echoed by prompts; when the SQL seed creates an account, it requires a 16-character password with upper- and lowercase letters, a number, and a symbol, then hashes it with PostgreSQL `pgcrypto` bcrypt. Do not put passwords in shell arguments, SQL files, committed environment files, or terminal transcripts.
 
 From PowerShell, open an interactive session in the directory containing the SQL files:
 
@@ -54,7 +54,9 @@ From PowerShell, open an interactive session in the directory containing the SQL
 psql "$env:DATABASE_URL"
 ```
 
-At the `psql` prompt, disable history for the provisioning session, enter two different strong passwords when prompted, then apply the schema and seed:
+For environment-based bootstrap on a new database, first apply `schema.sql`, then start or deploy the server with `SUPER_ADMIN_EMAIL` and `SUPER_ADMIN_PASSWORD` configured. The startup helper creates the Super Admin before handling requests. Run `seed.sql` afterward to create the first tenant Admin; only its password is needed because the seed detects the existing Super Admin.
+
+For SQL-only provisioning, disable `psql` history, supply two separate passwords, and apply the schema and seed in one session:
 
 ```text
 \set HISTFILE NUL
@@ -77,9 +79,9 @@ New users must provide a valid invitation. The invitation fixes the organization
 
 Invitation redemption and support-override audit writes use PostgreSQL transactions. Organization Admins can issue and revoke invitations only for their organization. Codes expire after 24 hours, are shown once, and only their SHA-256 hashes are persisted.
 
-Business records are explicitly filtered by `organization_id` in addition to PostgreSQL row-level security. Super Admin accounts can read across organizations but cannot modify tenant data by default. A business-data write requires an active organization-scoped support override and is recorded in `support_override_audit` in the same transaction. Platform-scoped override is limited to creating an organization and its initial Admin invitation. Super Admins cannot be invited through the tenant invitation flow.
+Business records are explicitly filtered by `organization_id` in addition to PostgreSQL row-level security. Super Admin accounts can read across organizations but cannot modify tenant data by default. A business-data write requires an active organization-scoped support override and is recorded in `support_override_audit` in the same transaction; the `audit_logs` view exposes those entries. Platform-scoped override is limited to creating an organization and its initial Admin invitation. Super Admins cannot be invited through the tenant invitation flow.
 
-Sessions are signed `HttpOnly`, `SameSite=Lax` cookies (also `Secure` in production), expire according to organization settings, and use the `session_version` column to invalidate old cookies after password changes or resets. The system-backup endpoint remains unavailable until a persistent backup integration is configured; unsupported API paths return HTTP 501 rather than using local JSON files.
+Sessions are signed `HttpOnly`, `SameSite=Lax` cookies (also `Secure` in production), expire according to organization settings, and use the `session_version` column to invalidate old cookies after password changes or resets. Admins can download a consistent PostgreSQL JSON backup for their organization. Super Admin backups contain either the selected support organization or all organizations and omit password hashes, reset tokens, and session secrets. Unknown API paths return HTTP 404.
 
 ## Production Path
 

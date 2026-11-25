@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS users (
   status VARCHAR(30) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Active', 'Pending', 'Suspended', 'Inactive')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   approved_at TIMESTAMPTZ,
-  approved_by UUID REFERENCES users(user_uuid) ON DELETE SET NULL,
+  approved_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
   FOREIGN KEY (branch_id, organization_id) REFERENCES branches(id, organization_id),
   UNIQUE (id, organization_id),
   UNIQUE (organization_id, employee_id),
@@ -76,9 +76,27 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS user_uuid UUID NOT NULL DEFAULT gen_random_uuid();
-ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_by UUID;
+DO $$
+DECLARE
+  approved_by_type TEXT;
+BEGIN
+  SELECT data_type INTO approved_by_type
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'approved_by';
+
+  IF approved_by_type = 'uuid' THEN
+    ALTER TABLE users RENAME COLUMN approved_by TO approved_by_uuid;
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_approved_by_fkey;
+    ALTER TABLE users ADD COLUMN approved_by BIGINT;
+    UPDATE users user_row
+    SET approved_by = approver.id
+    FROM users approver
+    WHERE approver.user_uuid = user_row.approved_by_uuid;
+  END IF;
+END $$;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_by BIGINT;
 SELECT pg_temp.ensure_constraint('users', 'users_user_uuid_key', 'UNIQUE (user_uuid)');
-SELECT pg_temp.ensure_constraint('users', 'users_approved_by_fkey', 'FOREIGN KEY (approved_by) REFERENCES users(user_uuid) ON DELETE SET NULL');
+SELECT pg_temp.ensure_constraint('users', 'users_approved_by_fkey', 'FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL');
 
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
   id BIGSERIAL PRIMARY KEY,
@@ -460,6 +478,26 @@ BEGIN
       USING (id = nullif(current_setting('app.user_id', true), '')::bigint)
       WITH CHECK (id = nullif(current_setting('app.user_id', true), '')::bigint);
   END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'users' AND policyname = 'user_self_read'
+  ) THEN
+    CREATE POLICY user_self_read ON users FOR SELECT
+      USING (id = nullif(current_setting('app.user_id', true), '')::bigint);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'users' AND policyname = 'platform_bootstrap_super_admin'
+  ) THEN
+    CREATE POLICY platform_bootstrap_super_admin ON users FOR INSERT
+      WITH CHECK (
+        role = 'Super Admin'
+        AND organization_id IS NULL
+        AND branch_id IS NULL
+        AND status = 'Active'
+        AND current_setting('app.bootstrap_super_admin', true) = 'true'
+      );
+  END IF;
   ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
   ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
 END $$;
@@ -527,6 +565,10 @@ BEGIN
   END IF;
 END $$;
 REVOKE UPDATE, DELETE ON support_override_audit FROM PUBLIC;
+CREATE OR REPLACE VIEW audit_logs AS
+  SELECT id, actor_user_id, organization_id, scope, reason, action,
+         request_method, request_path, created_at
+  FROM support_override_audit;
 INSERT INTO schema_migrations(name)
 VALUES ('001_initial_tenant_schema')
 ON CONFLICT (name) DO UPDATE SET applied_at = EXCLUDED.applied_at;

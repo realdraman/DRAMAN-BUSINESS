@@ -1,6 +1,6 @@
--- Set app.initial_super_admin_password and app.initial_tenant_admin_password
--- in the provisioning session before running this seed. Passwords are checked
--- and hashed by pgcrypto; only the bcrypt hashes are persisted.
+-- Set app.initial_tenant_admin_password before running this seed. If no Super
+-- Admin exists, also set app.initial_super_admin_password. Passwords are hashed
+-- by pgcrypto; only the bcrypt hashes are persisted.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -18,7 +18,7 @@ DECLARE
   super_admin_password TEXT := current_setting('app.initial_super_admin_password', true);
   tenant_admin_password TEXT := current_setting('app.initial_tenant_admin_password', true);
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = 'platform-admin@draman.local') THEN
+  IF NOT EXISTS (SELECT 1 FROM users WHERE role = 'Super Admin') THEN
     IF super_admin_password IS NULL OR length(super_admin_password) < 16
       OR super_admin_password !~ '[A-Z]'
       OR super_admin_password !~ '[a-z]'
@@ -56,12 +56,12 @@ BEGIN
       'Admin',
       'Active',
       NOW(),
-      platform_user.user_uuid
+      platform_user.id
     FROM organizations organization
     JOIN branches branch ON branch.organization_id = organization.id AND branch.name = 'Main Branch'
-    JOIN users platform_user ON lower(platform_user.email) = 'platform-admin@draman.local'
+    JOIN users platform_user ON platform_user.role = 'Super Admin'
     WHERE organization.id = 1
-    ORDER BY branch.id
+    ORDER BY branch.id, platform_user.id
     LIMIT 1;
   END IF;
 END;

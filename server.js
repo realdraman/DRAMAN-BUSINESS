@@ -54,6 +54,9 @@ app.use((req, res, next) => {
   req.body = req.body || {};
   next();
 });
+app.use((req, res, next) => {
+  superAdminInitialization.then(() => next());
+});
 
 function reply(res, status, data) {
   res.set("Cache-Control", "no-store");
@@ -96,12 +99,20 @@ async function transaction(callback) {
   }
 }
 
-async function setContext(client, { organizationId = null, userId = null, globalReadOnly = true, platformOverride = false, supportOverride = false } = {}) {
+async function setContext(client, {
+  organizationId = null,
+  userId = null,
+  globalReadOnly = false,
+  platformOverride = false,
+  supportOverride = false,
+  superAdminBootstrap = false
+} = {}) {
   await client.query("SELECT set_config('app.global_read_only', $1, true)", [globalReadOnly ? "true" : "false"]);
   await client.query("SELECT set_config('app.organization_id', $1, true)", [organizationId == null ? "" : String(organizationId)]);
   await client.query("SELECT set_config('app.user_id', $1, true)", [userId == null ? "" : String(userId)]);
   await client.query("SELECT set_config('app.platform_override', $1, true)", [platformOverride ? "true" : "false"]);
   await client.query("SELECT set_config('app.support_override', $1, true)", [supportOverride ? "true" : "false"]);
+  await client.query("SELECT set_config('app.bootstrap_super_admin', $1, true)", [superAdminBootstrap ? "true" : "false"]);
 }
 
 async function readQuery(query, values = [], context = {}) {
@@ -110,6 +121,52 @@ async function readQuery(query, values = [], context = {}) {
     return client.query(query, values);
   });
 }
+
+async function ensureSuperAdmin() {
+  if (!pool) return false;
+  const email = String(process.env.SUPER_ADMIN_EMAIL || "").trim().toLowerCase();
+  const password = String(process.env.SUPER_ADMIN_PASSWORD || "");
+  return transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", ["draman.ensure_super_admin"]);
+    await setContext(client, { globalReadOnly: true });
+    const { rows: admins } = await client.query(
+      "SELECT id FROM users WHERE role = 'Super Admin' LIMIT 1"
+    );
+    if (admins[0]) return false;
+    if (!email || !password) return false;
+    if (!validEmail(email) || password.length < 10 || password.length > 128) {
+      throw new Error("SUPER_ADMIN_EMAIL must be valid and SUPER_ADMIN_PASSWORD must contain 10 to 128 characters.");
+    }
+
+    const { rows: emailMatches } = await client.query(
+      "SELECT id FROM users WHERE lower(email) = lower($1) LIMIT 1",
+      [email]
+    );
+    if (emailMatches[0]) {
+      throw new Error("SUPER_ADMIN_EMAIL is already assigned to a non-Super Admin account.");
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const fullName = email.split("@")[0].replace(/[._-]+/g, " ").trim().slice(0, 160) || "Platform Administrator";
+    await setContext(client, { globalReadOnly: false, superAdminBootstrap: true });
+    await client.query(
+      `INSERT INTO users (full_name, email, password_hash, role, status, approved_at)
+       VALUES ($1, $2, $3, 'Super Admin', 'Active', NOW())`,
+      [fullName, email, passwordHash]
+    );
+    return true;
+  });
+}
+
+const superAdminInitialization = pool
+  ? ensureSuperAdmin().then((created) => {
+      if (created) console.log("Bootstrapped the configured Super Admin account.");
+      return created;
+    }).catch((error) => {
+      console.error("Could not ensure the configured Super Admin account:", error.message);
+      return false;
+    })
+  : Promise.resolve(false);
 
 function publicUser(user) {
   const { password_hash, session_version, ...safeUser } = user;
@@ -200,7 +257,7 @@ function clearSessionCookie(res) {
 
 async function loadUser(userId) {
   return transaction(async (client) => {
-    await setContext(client);
+    await setContext(client, { userId, globalReadOnly: false });
     const { rows } = await client.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [userId]);
     return rows[0] || null;
   });
@@ -224,7 +281,8 @@ async function authenticate(req, res, next) {
     if (user.organization_id != null) {
       const { rows: organizations } = await readQuery(
         "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
-        [user.organization_id]
+        [user.organization_id],
+        { organizationId: user.organization_id }
       );
       const organization = organizations[0];
       if (!organization || organization.status !== "Active") {
@@ -234,7 +292,8 @@ async function authenticate(req, res, next) {
       if (user.branch_id != null) {
         const { rows: branches } = await readQuery(
           "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 LIMIT 1",
-          [user.branch_id, user.organization_id]
+          [user.branch_id, user.organization_id],
+          { organizationId: user.organization_id }
         );
         user.branch = branches[0] || null;
       }
@@ -260,7 +319,7 @@ async function auditOverride(client, req, action, override) {
   const organizationId = override && override.scope === "organization" ? override.organization_id : null;
   await setContext(client, {
     organizationId,
-    globalReadOnly: true,
+    globalReadOnly: organizationId == null,
     platformOverride: !organizationId,
     supportOverride: Boolean(organizationId)
   });
@@ -362,7 +421,7 @@ async function businessTransaction(req, organizationId, action, callback) {
     await setContext(client, {
       organizationId,
       userId: req.authUser.id,
-      globalReadOnly: isSuperAdmin(req),
+      globalReadOnly: false,
       supportOverride: isSuperAdmin(req)
     });
     return callback(client);
@@ -387,7 +446,7 @@ async function auditSupportWrite(req, action, callback) {
     const orgId = override.scope === "organization" ? override.organization_id : null;
     await setContext(client, {
       organizationId: orgId,
-      globalReadOnly: true,
+      globalReadOnly: orgId == null,
       platformOverride: override.scope === "platform",
       supportOverride: override.scope === "organization"
     });
@@ -408,7 +467,8 @@ app.post("/api/login", async (req, res) => {
   try {
     const { rows } = await readQuery(
       "SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1",
-      [email]
+      [email],
+      { globalReadOnly: true }
     );
     const user = rows[0];
     if (!user || !await bcrypt.compare(password, user.password_hash)) {
@@ -424,7 +484,8 @@ app.post("/api/login", async (req, res) => {
     if (user.organization_id != null) {
       const result = await readQuery(
         "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
-        [user.organization_id]
+        [user.organization_id],
+        { organizationId: user.organization_id }
       );
       organization = result.rows[0] || null;
       if (!organization || organization.status !== "Active") {
@@ -432,7 +493,8 @@ app.post("/api/login", async (req, res) => {
       }
       const branchResult = await readQuery(
         "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 LIMIT 1",
-        [user.branch_id, user.organization_id]
+        [user.branch_id, user.organization_id],
+        { organizationId: user.organization_id }
       );
       if (!branchResult.rows[0] || branchResult.rows[0].status !== "Active") {
         return fail(res, 403, "Your account is active but no branch is assigned. Contact your organization administrator.", "BRANCH_UNASSIGNED");
@@ -464,7 +526,7 @@ app.post("/api/register", async (req, res) => {
   if (!invitationCode) return fail(res, 403, "A valid organization invitation is required to create a staff account.", "INVITATION_REQUIRED");
   try {
     const registeredUser = await transaction(async (client) => {
-      await setContext(client);
+      await setContext(client, { globalReadOnly: true });
       const { rows: invitations } = await client.query(
         `SELECT * FROM invitation_codes
          WHERE code_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > NOW()
@@ -477,7 +539,7 @@ app.post("/api/register", async (req, res) => {
         error.code = "INVITATION_INVALID";
         throw error;
       }
-      await setContext(client, { organizationId: invitation.organization_id, globalReadOnly: true });
+      await setContext(client, { organizationId: invitation.organization_id, globalReadOnly: false });
       const { rows: organizations } = await client.query(
         "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
         [invitation.organization_id]
@@ -604,7 +666,11 @@ app.post("/api/support-override", authenticate, async (req, res) => {
   let organization = null;
   if (scope === "organization") {
     try {
-      const result = await readQuery("SELECT id, name, status FROM organizations WHERE id = $1 LIMIT 1", [Number(body.organization_id)]);
+      const result = await readQuery(
+        "SELECT id, name, status FROM organizations WHERE id = $1 LIMIT 1",
+        [Number(body.organization_id)],
+        { globalReadOnly: true }
+      );
       organization = result.rows[0];
     } catch (error) {
       console.error("Could not read support organization:", error.message);
@@ -632,14 +698,20 @@ app.post("/api/support-override", authenticate, async (req, res) => {
 
 app.get("/api/organizations", authenticate, async (req, res) => {
   if (!requirePool(res)) return;
+  const organizationId = selectedOrganization(req);
   try {
-    const { rows } = await readQuery(
-      "SELECT id, name, status, created_at FROM organizations ORDER BY id",
-      [],
-      { globalReadOnly: true }
-    );
-    const orgId = selectedOrganization(req);
-    reply(res, 200, orgId == null ? rows : rows.filter((row) => Number(row.id) === orgId));
+    const result = organizationId == null
+      ? await readQuery(
+        "SELECT id, name, status, created_at FROM organizations ORDER BY id",
+        [],
+        { globalReadOnly: true }
+      )
+      : await readQuery(
+        "SELECT id, name, status, created_at FROM organizations WHERE id = $1 ORDER BY id",
+        [organizationId],
+        { organizationId }
+      );
+    reply(res, 200, result.rows);
   } catch (error) {
     console.error("Could not list organizations:", error.message);
     fail(res, 503, "Could not list organizations using PostgreSQL.");
@@ -696,7 +768,7 @@ app.get("/api/branches", authenticate, async (req, res) => {
   const organizationId = selectedOrganization(req);
   try {
     const { rows } = organizationId == null
-      ? await readQuery("SELECT id, organization_id, name, status, created_at FROM branches ORDER BY id")
+      ? await readQuery("SELECT id, organization_id, name, status, created_at FROM branches ORDER BY id", [], { globalReadOnly: true })
       : await readQuery("SELECT id, organization_id, name, status, created_at FROM branches WHERE organization_id = $1 ORDER BY id", [organizationId], { organizationId });
     reply(res, 200, rows);
   } catch (error) {
@@ -734,7 +806,7 @@ app.post("/api/branches", authenticate, async (req, res) => {
 async function auditSupportWriteIfNeeded(req, action, callback) {
   if (isSuperAdmin(req)) return auditSupportWrite(req, action, callback);
   return transaction(async (client) => {
-    await setContext(client, { organizationId: req.authUser.organization_id, globalReadOnly: true });
+    await setContext(client, { organizationId: req.authUser.organization_id, globalReadOnly: false });
     return callback(client);
   });
 }
@@ -773,7 +845,7 @@ app.get("/api/team", authenticate, async (req, res) => {
   const organizationId = selectedOrganization(req);
   try {
     const result = organizationId == null
-      ? await readQuery("SELECT * FROM users WHERE role <> 'Super Admin' ORDER BY id")
+      ? await readQuery("SELECT * FROM users WHERE role <> 'Super Admin' ORDER BY id", [], { globalReadOnly: true })
       : await readQuery("SELECT * FROM users WHERE organization_id = $1 ORDER BY id", [organizationId], { organizationId });
     reply(res, 200, result.rows.map(publicUser));
   } catch (error) {
@@ -802,7 +874,7 @@ app.post("/api/team/:id/approve", authenticate, async (req, res) => {
         `UPDATE users SET status = 'Active', approved_at = NOW(), approved_by = $1, branch_id = $2
          WHERE id = $3 AND organization_id = $4 AND status = 'Pending'
          RETURNING *`,
-        [req.authUser.user_uuid, branchId, Number(req.params.id), organizationId]
+        [req.authUser.id, branchId, Number(req.params.id), organizationId]
       );
     });
     if (result === null) return fail(res, 400, "Choose an active branch in this organization before approving the account.");
@@ -823,7 +895,7 @@ app.get("/api/invitations", authenticate, async (req, res) => {
   const organizationId = selectedOrganization(req);
   try {
     const result = organizationId == null
-      ? await readQuery("SELECT * FROM invitation_codes ORDER BY created_at DESC")
+      ? await readQuery("SELECT * FROM invitation_codes ORDER BY created_at DESC", [], { globalReadOnly: true })
       : await readQuery("SELECT * FROM invitation_codes WHERE organization_id = $1 ORDER BY created_at DESC", [organizationId], { organizationId });
     reply(res, 200, result.rows.map(invitationStatus));
   } catch (error) {
@@ -904,7 +976,7 @@ app.get("/api/support-override-audit", authenticate, async (req, res) => {
   const organizationId = selectedOrganization(req);
   try {
     const result = organizationId == null
-      ? await readQuery("SELECT * FROM support_override_audit ORDER BY created_at DESC")
+      ? await readQuery("SELECT * FROM support_override_audit ORDER BY created_at DESC", [], { globalReadOnly: true })
       : await readQuery("SELECT * FROM support_override_audit WHERE organization_id = $1 ORDER BY created_at DESC", [organizationId], { organizationId });
     reply(res, 200, result.rows);
   } catch (error) {
@@ -1266,7 +1338,10 @@ app.get("/api/customers", authenticate, async (req, res) => {
          FROM customers c LEFT JOIN LATERAL
            (SELECT * FROM guarantors WHERE customer_id = c.id AND organization_id = $1 ORDER BY id LIMIT 1) g ON TRUE
          WHERE c.organization_id = $1 ORDER BY c.created_at DESC`;
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list customers:", error.message);
@@ -1410,7 +1485,10 @@ app.get("/api/loans", authenticate, async (req, res) => {
          FROM loans l JOIN customers c ON c.id = l.customer_id AND c.organization_id = l.organization_id
          LEFT JOIN users u ON u.id = l.assigned_officer AND u.organization_id = l.organization_id
          WHERE l.organization_id = $1 ORDER BY l.created_at DESC`;
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list loans:", error.message);
@@ -1536,7 +1614,10 @@ app.get("/api/payments", authenticate, async (req, res) => {
          JOIN loans l ON l.id = p.loan_id AND l.organization_id = p.organization_id
          LEFT JOIN users u ON u.id = p.received_by AND u.organization_id = p.organization_id
          WHERE p.organization_id = $1 ORDER BY p.payment_date DESC`;
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list payments:", error.message);
@@ -1635,7 +1716,10 @@ app.get("/api/inventory", authenticate, async (req, res) => {
     const query = organizationId == null
       ? "SELECT * FROM inventory ORDER BY created_at DESC"
       : "SELECT * FROM inventory WHERE organization_id = $1 ORDER BY created_at DESC";
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list inventory:", error.message);
@@ -1741,7 +1825,10 @@ app.get("/api/agreements", authenticate, async (req, res) => {
       : `SELECT a.*, c.full_name AS customer_name, c.customer_code
          FROM agreements a JOIN customers c ON c.id = a.customer_id AND c.organization_id = a.organization_id
          WHERE a.organization_id = $1 ORDER BY a.created_at DESC`;
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list agreements:", error.message);
@@ -1766,7 +1853,10 @@ app.get("/api/sales", authenticate, async (req, res) => {
          LEFT JOIN customers c ON c.id = s.customer_id AND c.organization_id = s.organization_id
          LEFT JOIN users u ON u.id = s.sold_by AND u.organization_id = s.organization_id
          WHERE s.organization_id = $1 ORDER BY s.sale_date DESC`;
-    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, rows);
   } catch (error) {
     console.error("Could not list sales:", error.message);
@@ -1901,7 +1991,7 @@ app.get("/api/summary", authenticate, async (req, res) => {
   const organizationId = businessOrganization(req);
   try {
     const data = await transaction(async (client) => {
-      await setContext(client, { organizationId, globalReadOnly: true });
+      await setContext(client, { organizationId, globalReadOnly: organizationId == null });
       const tenantClause = organizationId == null ? "" : " WHERE organization_id = $1";
       const values = organizationId == null ? [] : [organizationId];
       const loanQuery = organizationId == null
@@ -1997,7 +2087,10 @@ app.get("/api/notifications", authenticate, async (req, res) => {
     const query = organizationId == null
       ? "SELECT 'low_stock' AS type, id, product_name AS title, quantity AS detail, created_at FROM inventory WHERE quantity <= 2 ORDER BY created_at DESC LIMIT 20"
       : "SELECT 'low_stock' AS type, id, product_name AS title, quantity AS detail, created_at FROM inventory WHERE organization_id = $1 AND quantity <= 2 ORDER BY created_at DESC LIMIT 20";
-    const result = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    const result = await readQuery(query, organizationId == null ? [] : [organizationId], {
+      organizationId,
+      globalReadOnly: organizationId == null
+    });
     reply(res, 200, result.rows);
   } catch (error) {
     console.error("Could not list notifications:", error.message);
@@ -2005,9 +2098,79 @@ app.get("/api/notifications", authenticate, async (req, res) => {
   }
 });
 
+app.post("/api/system-backup", authenticate, async (req, res) => {
+  if (!isSuperAdmin(req) && req.authUser.role !== "Admin") {
+    return fail(res, 403, "Administrator permission required to download a system backup.");
+  }
+  if (!requirePool(res)) return;
+  const selectedOrgId = selectedOrganization(req);
+  try {
+    const createdAt = new Date().toISOString();
+    const organizations = await transaction(async (client) => {
+      await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await setContext(client, { globalReadOnly: true });
+      const orgResult = selectedOrgId == null
+        ? await client.query("SELECT id FROM organizations ORDER BY id")
+        : await client.query("SELECT id FROM organizations WHERE id = $1 LIMIT 1", [selectedOrgId]);
+      const tenantIds = orgResult.rows.map((row) => Number(row.id));
+      const exportTables = [
+        "branches", "customers", "guarantors", "loans", "loan_schedule", "payments",
+        "penalties", "inventory", "sales", "installment_payments", "agreements",
+        "business_settings", "loan_settings", "activity_logs"
+      ];
+      const exports = [];
+
+      for (const organizationId of tenantIds) {
+        await setContext(client, { organizationId, globalReadOnly: false });
+        const { rows: organizationRows } = await client.query(
+          "SELECT id, name, status, settings, created_at FROM organizations WHERE id = $1 LIMIT 1",
+          [organizationId]
+        );
+        if (!organizationRows[0]) continue;
+
+        const data = {};
+        for (const table of exportTables) {
+          const { rows } = await client.query(
+            `SELECT * FROM ${table} WHERE organization_id = $1 ORDER BY id`,
+            [organizationId]
+          );
+          data[table] = rows;
+        }
+        const { rows: users } = await client.query(
+          `SELECT id, user_uuid, organization_id, branch_id, full_name, email, phone,
+                  employee_id, role, status, created_at, approved_at, approved_by
+           FROM users WHERE organization_id = $1 ORDER BY id`,
+          [organizationId]
+        );
+        data.users = users;
+        const { rows: supportAudit } = await client.query(
+          "SELECT * FROM support_override_audit WHERE organization_id = $1 ORDER BY id",
+          [organizationId]
+        );
+        data.support_override_audit = supportAudit;
+        exports.push({ organization: organizationRows[0], data });
+      }
+      return exports;
+    });
+
+    if (selectedOrgId != null && !organizations.length) {
+      return fail(res, 404, "Organization not found for this backup.");
+    }
+    reply(res, 200, {
+      file_name: `draman-backup-${createdAt.slice(0, 10)}.json`,
+      created_at: createdAt,
+      format_version: 1,
+      organizations
+    });
+  } catch (error) {
+    console.error("Could not create PostgreSQL backup:", error.message);
+    fail(res, 503, "Could not create the system backup using PostgreSQL.");
+  }
+});
+
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/")) {
-    return fail(res, 501, "This route is not yet backed by PostgreSQL and is unavailable. No local JSON state is used.");
+    return fail(res, 404, "API route not found.");
   }
   const file = publicFiles[req.path];
   if (!file) return res.status(404).send("Not found");
