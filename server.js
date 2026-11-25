@@ -2190,7 +2190,7 @@ app.use((error, req, res, next) => {
   fail(res, error.type === "entity.too.large" ? 413 : 400, "The request could not be processed.");
 });
 
-if (require.main === module) {
+if (require.main === module && !process.env.VERCEL) {
   app.listen(PORT, () => console.log(`DRAMAN LMS API listening on http://localhost:${PORT}`));
 }
 

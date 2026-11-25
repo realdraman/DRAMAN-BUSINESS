@@ -1,18 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
   "functions": {
     "server.js": {
       "includeFiles": "{index.html,app.jsx,styles.css,draman-logo.svg}"
     }
-  },
-  "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/server.js"
-    },
-    {
-      "source": "/",
-      "destination": "/index.html"
-    }
-  ]
+  }
 }
