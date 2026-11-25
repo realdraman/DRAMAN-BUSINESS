@@ -1,0 +1,1 @@
+2026-11-24T01:31:33.1632815+03:00 [t1.2.1-dba] [notify:devops] Hosted PostgreSQL remains unavailable/not configured. Docker unavailable; local PostgreSQL 17.12 on port 55432 is the only verified environment.

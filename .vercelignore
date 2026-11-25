@@ -1,6 +1,7 @@
 .env
 .env.*
 .draman-private/
+.test-data/
 private-data/
 password-reset-outbox/
 first-admin-credentials.txt

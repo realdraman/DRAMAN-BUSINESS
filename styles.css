@@ -456,6 +456,40 @@ button {
   box-shadow: 0 0 0 3px rgba(18, 56, 95, 0.11);
 }
 
+.password-field {
+  position: relative;
+}
+
+.password-field input {
+  padding-right: 48px;
+}
+
+.password-field__toggle {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.password-field__toggle:hover {
+  color: var(--harbor);
+  background: var(--soft-surface);
+}
+
+.password-field__toggle .icon {
+  width: 17px;
+  height: 17px;
+}
+
 .field.full {
   grid-column: 1 / -1;
 }
@@ -943,6 +977,10 @@ button {
 
 .team-approval-actions select {
   min-width: 140px;
+}
+
+.team-approval-actions .branch-select {
+  min-width: 170px;
 }
 
 .team-approval-actions .primary-button {
@@ -1603,6 +1641,37 @@ button {
 .invitation-row > div > span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.support-override {
+  min-height: 34px;
+  padding: 6px 10px;
+  border-color: color-mix(in srgb, #b45309 45%, var(--line));
+  color: #92400e;
+  background: color-mix(in srgb, #fbbf24 12%, var(--paper));
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.support-override-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 18px;
+  border-bottom: 1px solid #f59e0b;
+  color: #78350f;
+  background: #fef3c7;
+  font-size: 12px;
+}
+
+.support-override-banner strong {
+  display: block;
+}
+
+.support-override-modal {
+  display: grid;
+  gap: 14px;
 }
 
 .session-loading {

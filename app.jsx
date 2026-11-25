@@ -1,16 +1,46 @@
 const { useEffect, useMemo, useRef, useState } = React;
 
 function apiError(error) {
-  if (error.response && error.response.status === 401) {
+  const response = error.response;
+  const data = response && response.data;
+  if (response && response.status === 401) {
     api.handleUnauthorized();
   }
-  const message = error.response && error.response.data && error.response.data.message;
-  return new Error(message || error.message || "Request failed");
+  const message = data && typeof data === "object" ? data.message : "";
+  const responseText = typeof data === "string" ? data : data ? JSON.stringify(data) : error.message || "";
+  const requestError = new Error(message || error.message || "Request failed");
+  requestError.status = response ? response.status : null;
+  requestError.responseText = responseText;
+  return requestError;
 }
 
-function handleApiResponseError(response, data) {
+function apiRequestUrl(url) {
+  const requestUrl = new URL(url, window.location.origin);
+  if (requestUrl.origin !== window.location.origin) {
+    throw new Error("API requests must use a relative same-origin URL.");
+  }
+  return `${requestUrl.pathname}${requestUrl.search}`;
+}
+
+async function readApiResponse(response) {
+  const responseText = await response.text();
+  let data = {};
+  if (responseText) {
+    try {
+      data = JSON.parse(responseText);
+    } catch (error) {
+      data = { message: responseText };
+    }
+  }
+  return { data, responseText };
+}
+
+function handleApiResponseError(response, data, responseText) {
   if (response.status === 401) api.handleUnauthorized();
-  throw new Error(data.message || "Request failed");
+  const requestError = new Error(data.message || responseText || "Request failed");
+  requestError.status = response.status;
+  requestError.responseText = responseText;
+  throw requestError;
 }
 
 const api = {
@@ -20,82 +50,86 @@ const api = {
     window.dispatchEvent(new Event("draman-session-expired"));
   },
   async get(url) {
+    const requestUrl = apiRequestUrl(url);
     if (window.axios) {
       try {
-        return await window.axios.get(url, { withCredentials: true });
+        return await window.axios.get(requestUrl, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
-    const response = await fetch(url, { credentials: "same-origin" });
-    const data = await response.json();
-    if (!response.ok) handleApiResponseError(response, data);
+    const response = await fetch(requestUrl, { credentials: "same-origin" });
+    const { data, responseText } = await readApiResponse(response);
+    if (!response.ok) handleApiResponseError(response, data, responseText);
     return { data };
   },
   async post(url, payload) {
+    const requestUrl = apiRequestUrl(url);
     if (window.axios) {
       try {
-        return await window.axios.post(url, payload, { withCredentials: true });
+        return await window.axios.post(requestUrl, payload, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
-    const response = await fetch(url, {
+    const response = await fetch(requestUrl, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
-    if (!response.ok) handleApiResponseError(response, data);
+    const { data, responseText } = await readApiResponse(response);
+    if (!response.ok) handleApiResponseError(response, data, responseText);
     return { data };
   },
   async put(url, payload) {
+    const requestUrl = apiRequestUrl(url);
     if (window.axios) {
       try {
-        return await window.axios.put(url, payload, { withCredentials: true });
+        return await window.axios.put(requestUrl, payload, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
-    const response = await fetch(url, {
+    const response = await fetch(requestUrl, {
       method: "PUT",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
-    if (!response.ok) handleApiResponseError(response, data);
+    const { data, responseText } = await readApiResponse(response);
+    if (!response.ok) handleApiResponseError(response, data, responseText);
     return { data };
   },
   async delete(url) {
+    const requestUrl = apiRequestUrl(url);
     if (window.axios) {
       try {
-        return await window.axios.delete(url, { withCredentials: true });
+        return await window.axios.delete(requestUrl, { withCredentials: true });
       } catch (error) {
         throw apiError(error);
       }
     }
-    const response = await fetch(url, {
+    const response = await fetch(requestUrl, {
       method: "DELETE",
       credentials: "same-origin"
     });
-    const data = await response.json();
-    if (!response.ok) handleApiResponseError(response, data);
+    const { data, responseText } = await readApiResponse(response);
+    if (!response.ok) handleApiResponseError(response, data, responseText);
     return { data };
   }
 };
 
 const navItems = [
-  { id: "dashboard", label: "Dashboard", icon: "layout-dashboard", roles: ["Super Admin", "Loan Officer", "Cashier", "Inventory Manager"] },
-  { id: "customers", label: "Customers", icon: "users", roles: ["Super Admin", "Loan Officer"] },
-  { id: "loans", label: "Loans", icon: "landmark", roles: ["Super Admin", "Loan Officer"] },
-  { id: "payments", label: "Payments", icon: "receipt", roles: ["Super Admin", "Loan Officer", "Cashier"] },
-  { id: "inventory", label: "Inventory", icon: "warehouse", roles: ["Super Admin", "Inventory Manager"] },
-  { id: "reports", label: "Reports", icon: "chart-no-axes-combined", roles: ["Super Admin", "Loan Officer", "Cashier", "Inventory Manager"] },
-  { id: "agreements", label: "Agreements", icon: "file-signature", roles: ["Super Admin", "Loan Officer"] },
-  { id: "team", label: "Team Access", icon: "user-round-plus", roles: ["Super Admin"] },
-  { id: "settings", label: "Settings", icon: "settings", roles: ["Super Admin"] }
+  { id: "dashboard", label: "Dashboard", icon: "layout-dashboard", roles: ["Super Admin", "Admin", "Loan Officer", "Cashier", "Inventory Manager"] },
+  { id: "customers", label: "Customers", icon: "users", roles: ["Super Admin", "Admin", "Loan Officer"] },
+  { id: "loans", label: "Loans", icon: "landmark", roles: ["Super Admin", "Admin", "Loan Officer"] },
+  { id: "payments", label: "Payments", icon: "receipt", roles: ["Super Admin", "Admin", "Loan Officer", "Cashier"] },
+  { id: "inventory", label: "Inventory", icon: "warehouse", roles: ["Super Admin", "Admin", "Inventory Manager"] },
+  { id: "reports", label: "Reports", icon: "chart-no-axes-combined", roles: ["Super Admin", "Admin", "Loan Officer", "Cashier", "Inventory Manager"] },
+  { id: "agreements", label: "Agreements", icon: "file-signature", roles: ["Super Admin", "Admin", "Loan Officer"] },
+  { id: "team", label: "Team Access", icon: "user-round-plus", roles: ["Admin", "Super Admin"] },
+  { id: "settings", label: "Settings", icon: "settings", roles: ["Admin", "Super Admin"] }
 ];
 
 const emptyCustomerForm = {
@@ -338,6 +372,33 @@ function Field({ label, children, full }) {
   );
 }
 
+function PasswordField({ label, value, onChange, autoComplete, minLength, required }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <Field label={label}>
+      <div className="password-field">
+        <input
+          type={visible ? "text" : "password"}
+          value={value}
+          onChange={onChange}
+          autoComplete={autoComplete}
+          minLength={minLength}
+          required={required}
+        />
+        <button
+          className="password-field__toggle"
+          type="button"
+          onClick={() => setVisible((current) => !current)}
+          aria-label={visible ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
+          aria-pressed={visible}
+        >
+          <Icon name={visible ? "eye-off" : "eye"} />
+        </button>
+      </div>
+    </Field>
+  );
+}
+
 function ThemeToggle({ theme, onToggle }) {
   const isDark = theme === "dark";
   return (
@@ -391,6 +452,10 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
       const { data } = await api.post("/api/login", credentials);
       onLogin(data);
     } catch (requestError) {
+      console.error("Login request failed:", {
+        status: requestError.status,
+        responseText: requestError.responseText || requestError.message
+      });
       setError(requestError.message || "Unable to sign in");
     } finally {
       setLoading(false);
@@ -408,6 +473,10 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
       setMode("login");
       setMessage(data.message);
     } catch (requestError) {
+      console.error("Signup request failed:", {
+        status: requestError.status,
+        responseText: requestError.responseText || requestError.message
+      });
       setError(requestError.message || "Unable to create account");
     } finally {
       setLoading(false);
@@ -504,9 +573,7 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
                 <Field label="Email">
                   <input type="email" value={credentials.email} onChange={(event) => setCredentials({ ...credentials, email: event.target.value })} autoComplete="username" required />
                 </Field>
-                <Field label="Password">
-                  <input type="password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} autoComplete="current-password" required />
-                </Field>
+                <PasswordField label="Password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} autoComplete="current-password" required />
               </div>
               <button className="primary-button auth-submit" type="submit" disabled={loading}>
                 <Icon name="arrow-right" />{loading ? "Signing in..." : "Sign in securely"}
@@ -518,7 +585,7 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
             <form onSubmit={submitRegistration}>
               <span className="auth-eyebrow">CREATE YOUR ACCOUNT</span>
               <h2>Join the team.</h2>
-              <p>Use your personal email. An administrator must approve uninvited account requests.</p>
+              <p>Use the personal email and password you will use to sign in. A valid invitation is required.</p>
               <div className="form-grid single auth-fields">
                 <Field label="Full name">
                   <input value={registration.full_name} onChange={(event) => setRegistration({ ...registration, full_name: event.target.value })} autoComplete="name" minLength="2" maxLength="100" required />
@@ -529,14 +596,12 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
                 <Field label="Staff ID (optional)">
                   <input value={registration.employee_id} onChange={(event) => setRegistration({ ...registration, employee_id: event.target.value })} placeholder="May be assigned later" maxLength="32" />
                 </Field>
-                <Field label="Create password">
-                  <input type="password" value={registration.password} onChange={(event) => setRegistration({ ...registration, password: event.target.value })} autoComplete="new-password" minLength="10" required />
-                </Field>
-                <Field label="Invitation code (optional)">
-                  <input value={registration.invitation_code} onChange={(event) => setRegistration({ ...registration, invitation_code: event.target.value })} placeholder="DRM-..." autoComplete="off" />
+                <PasswordField label="Create password" value={registration.password} onChange={(event) => setRegistration({ ...registration, password: event.target.value })} autoComplete="new-password" minLength="10" required />
+                <Field label="Invitation code">
+                  <input value={registration.invitation_code} onChange={(event) => setRegistration({ ...registration, invitation_code: event.target.value })} placeholder="DRM-..." autoComplete="off" required />
                 </Field>
               </div>
-              <div className="auth-note"><Icon name="shield-check" /> Uninvited accounts stay pending until an administrator assigns a role and approves them.</div>
+              <div className="auth-note"><Icon name="shield-check" /> The invitation binds your organization, branch, role and approval status. Your password is saved as your account credential.</div>
               <button className="primary-button auth-submit" type="submit" disabled={loading}>
                 <Icon name="user-round-plus" />{loading ? "Creating account..." : "Create account"}
               </button>
@@ -585,11 +650,13 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
   );
 }
 
-function Sidebar({ activeView, setActiveView, user, permissions }) {
+function Sidebar({ activeView, setActiveView, user, permissions, supportOverride }) {
   const allowedNav = navItems.filter((item) =>
-    user.role === "Super Admin"
+    user.role === "Super Admin" && !supportOverride
+      ? item.id === "dashboard"
+      : user.role === "Super Admin"
       ? item.roles.includes(user.role)
-      : item.id === "dashboard" || permissions.includes(item.id)
+      : item.id === "dashboard" || item.roles.includes(user.role) || permissions.includes(item.id)
   );
 
   return (
@@ -700,32 +767,191 @@ function AccountSettings({ user, onAccountUpdated }) {
   );
 }
 
-function Topbar({ user, search, setSearch, onLogout, theme, onToggleTheme, onAccountUpdated }) {
+function SupportOverrideControl({ session, onSessionUpdated }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [organizations, setOrganizations] = useState([]);
+  const [organizationId, setOrganizationId] = useState("");
+  const [reason, setReason] = useState("");
+  const [newOrganizationName, setNewOrganizationName] = useState("");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [issuedCode, setIssuedCode] = useState("");
+  const [saving, setSaving] = useState(false);
+  const override = session.support_override;
+
+  useEffect(() => {
+    if (!isOpen || override) return;
+    api.get("/api/organizations")
+      .then(({ data }) => {
+        setOrganizations(data);
+        setOrganizationId((current) => current || (data[0] ? String(data[0].id) : ""));
+      })
+      .catch((requestError) => setError(requestError.message || "Unable to list organizations."));
+  }, [isOpen, override]);
+
+  if (session.user.role !== "Super Admin") return null;
+
+  async function startOverride() {
+    setSaving(true);
+    setError("");
+    try {
+      const { data } = await api.post("/api/support-override", {
+        action: "start",
+        scope: "organization",
+        organization_id: Number(organizationId),
+        reason
+      });
+      onSessionUpdated({ ...session, support_override: data.support_override });
+      setIsOpen(false);
+      setReason("");
+    } catch (requestError) {
+      setError(requestError.message || "Unable to start support override.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function stopOverride() {
+    setSaving(true);
+    setError("");
+    try {
+      const { data } = await api.post("/api/support-override", { action: "stop" });
+      onSessionUpdated({ ...session, support_override: data.support_override });
+    } catch (requestError) {
+      setError(requestError.message || "Unable to end support override.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createOrganization() {
+    setSaving(true);
+    setError("");
+    setMessage("");
+    setIssuedCode("");
+    let started = false;
+    try {
+      await api.post("/api/support-override", { action: "start", scope: "platform", reason });
+      started = true;
+      const { data } = await api.post("/api/organizations", { name: newOrganizationName });
+      const stopped = await api.post("/api/support-override", { action: "stop" });
+      started = false;
+      onSessionUpdated({ ...session, support_override: stopped.data.support_override });
+      setIssuedCode(data.admin_invitation_code);
+      setMessage(`${data.organization.name} created. Share this one-time code with its first organization administrator.`);
+      setNewOrganizationName("");
+      setReason("");
+      setOrganizations((current) => [...current, data.organization]);
+    } catch (requestError) {
+      setError(requestError.message || "Unable to create organization.");
+      if (started) {
+        try {
+          const stopped = await api.post("/api/support-override", { action: "stop" });
+          onSessionUpdated({ ...session, support_override: stopped.data.support_override });
+        } catch (stopError) {
+          setError(`${requestError.message || "Unable to create organization."} End the active support override before continuing.`);
+        }
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
-    <header className="topbar">
-      <div className="search-field">
-        <Icon name="search" />
-        <input
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search customers, loans, receipts, or inventory"
-        />
-      </div>
-      <div className="topbar-actions">
-        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-        <NotificationCenter />
-        <SystemBackup isAdmin={user.role === "Super Admin"} />
-        <AccountSettings user={user} onAccountUpdated={onAccountUpdated} />
-        <div className="text-right">
-          <div className="topbar-user-name font-bold leading-tight">{user.full_name}</div>
-          <div className="compact muted">{user.role}</div>
-        </div>
-        <button className="ghost-button" type="button" onClick={onLogout}>
-          <Icon name="log-out" />
-          Logout
+    <>
+      {override ? (
+        <button className="support-override" type="button" onClick={stopOverride} disabled={saving}>
+          <Icon name="shield-alert" />{saving ? "Ending..." : "End support override"}
         </button>
-      </div>
-    </header>
+      ) : (
+        <button className="support-override" type="button" onClick={() => { setIsOpen(true); setError(""); setMessage(""); }}>
+          <Icon name="shield-check" />Support access
+        </button>
+      )}
+      {isOpen && !override ? (
+        <div className="account-modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !saving) setIsOpen(false);
+        }}>
+          <section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="support-override-title">
+            <div className="account-modal__header">
+              <div>
+                <span className="auth-eyebrow">AUDITED ELEVATION</span>
+                <h2 id="support-override-title">Support override</h2>
+              </div>
+              <button className="icon-button" type="button" aria-label="Close support override" onClick={() => setIsOpen(false)}>
+                <Icon name="x" />
+              </button>
+            </div>
+            <div className="support-override-modal">
+              <p className="compact muted">Super Admin access is read-only by default. Every override start and write is audited with your reason.</p>
+              <Field label="Organization">
+                <select value={organizationId} onChange={(event) => setOrganizationId(event.target.value)} required>
+                  {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
+                </select>
+              </Field>
+              <Field label="Support reason (15–500 characters)">
+                <textarea value={reason} onChange={(event) => setReason(event.target.value)} minLength="15" maxLength="500" required />
+              </Field>
+              {error ? <div className="error-box" role="alert">{error}</div> : null}
+              <div className="button-row">
+                <button className="primary-button" type="button" disabled={saving || !organizationId || reason.trim().length < 15} onClick={startOverride}>
+                  <Icon name="shield-alert" />{saving ? "Starting..." : "Start organization override"}
+                </button>
+              </div>
+              <hr />
+              <h3>Create an organization</h3>
+              <p className="compact muted">This platform-level override only creates a tenant and a one-time Admin invitation.</p>
+              <Field label="Organization name">
+                <input value={newOrganizationName} onChange={(event) => setNewOrganizationName(event.target.value)} minLength="2" maxLength="120" required />
+              </Field>
+              <button className="secondary-button" type="button" disabled={saving || newOrganizationName.trim().length < 2 || reason.trim().length < 15} onClick={createOrganization}>
+                <Icon name="building-2" />{saving ? "Creating..." : "Create tenant with audited override"}
+              </button>
+              {issuedCode ? <div className="issued-code" role="status"><strong>{issuedCode}</strong><span>Shown once. Expires in 24 hours.</span></div> : null}
+              {message ? <div className="success-box" role="status">{message}</div> : null}
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function Topbar({ user, session, search, setSearch, onLogout, theme, onToggleTheme, onAccountUpdated, onSessionUpdated }) {
+  return (
+    <>
+      <header className="topbar">
+        <div className="search-field">
+          <Icon name="search" />
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search customers, loans, receipts, or inventory"
+          />
+        </div>
+        <div className="topbar-actions">
+          <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+          <NotificationCenter />
+          <SystemBackup isAdmin={["Admin", "Super Admin"].includes(user.role)} />
+          <SupportOverrideControl session={session} onSessionUpdated={onSessionUpdated} />
+          <AccountSettings user={user} onAccountUpdated={onAccountUpdated} />
+          <div className="text-right">
+            <div className="topbar-user-name font-bold leading-tight">{user.full_name}</div>
+            <div className="compact muted">{user.role}</div>
+          </div>
+          <button className="ghost-button" type="button" onClick={onLogout}>
+            <Icon name="log-out" />
+            Logout
+          </button>
+        </div>
+      </header>
+      {session.support_override ? <div className="support-override-banner">
+        <div>
+          <strong>Audited support override · {session.support_override.scope === "platform" ? "Platform" : session.support_override.organization_name || `Organization ${session.support_override.organization_id}`}</strong>
+          <span>{session.support_override.reason}</span>
+        </div>
+      </div> : null}
+    </>
   );
 }
 
@@ -1072,7 +1298,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
   const [form, setForm] = useDraftState("customer", emptyCustomerForm, user.id);
   const [selectedTab, setSelectedTab] = useState("Personal details");
   const [message, setMessage] = useState("");
-  const isSuperAdmin = user.role === "Super Admin";
+  const isSuperAdmin = ["Admin", "Super Admin"].includes(user.role);
 
   const filteredCustomers = useMemo(() => {
     const query = globalSearch.trim().toLowerCase();
@@ -1515,7 +1741,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                   <th>Due date</th>
                   <th>Status</th>
                   <th>Officer</th>
-                  {user.role === "Super Admin" ? <th>Action</th> : null}
+                  {["Admin", "Super Admin"].includes(user.role) ? <th>Action</th> : null}
                 </tr>
               </thead>
               <tbody>
@@ -1528,7 +1754,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                     <td>{formatDate(loan.due_date)}</td>
                     <td><Badge tone={loan.status}>{loan.status}</Badge></td>
                     <td>{loan.assigned_officer}</td>
-                    {user.role === "Super Admin" ? (
+                    {["Admin", "Super Admin"].includes(user.role) ? (
                       <td>{loan.status === "Pending" ? (
                         <button className="secondary-button" type="button" onClick={() => approveLoan(loan)}>Approve</button>
                       ) : <span className="compact muted">—</span>}</td>
@@ -1536,7 +1762,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                   </tr>
                 )) : (
                   <tr>
-                    <td colSpan={user.role === "Super Admin" ? "8" : "7"}>
+                    <td colSpan={["Admin", "Super Admin"].includes(user.role) ? "8" : "7"}>
                       <div className="empty-state">No loans issued yet.</div>
                     </td>
                   </tr>
@@ -1796,7 +2022,7 @@ function ReceiptPreview({ selectedLoan, amount, user, receipt, settings }) {
 function InventoryManagement({ inventory, refreshData, user, settings }) {
   const [productForm, setProductForm] = useDraftState("product", emptyProductForm, user.id);
   const [message, setMessage] = useState("");
-  const isSuperAdmin = user.role === "Super Admin";
+  const isSuperAdmin = ["Admin", "Super Admin"].includes(user.role);
   const canManageInventory = isSuperAdmin || (settings.security.permissions[user.role] || []).includes("inventory");
   const stockValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.buying_price), 0);
   const retailValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.selling_price), 0);
@@ -2195,22 +2421,29 @@ function Settings({ settings, onSettingsChanged }) {
 function TeamAccess() {
   const [role, setRole] = useState("Cashier");
   const [count, setCount] = useState(1);
+  const [activationStatus, setActivationStatus] = useState("Pending");
+  const [branchId, setBranchId] = useState("");
   const [team, setTeam] = useState([]);
+  const [branches, setBranches] = useState([]);
   const [invitations, setInvitations] = useState([]);
   const [issuedCodes, setIssuedCodes] = useState([]);
-  const [approvalRoles, setApprovalRoles] = useState({});
+  const [approvalBranches, setApprovalBranches] = useState({});
   const [approvingId, setApprovingId] = useState(null);
+  const [revokingId, setRevokingId] = useState(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function refreshAccess() {
-    const [teamResult, inviteResult] = await Promise.all([
+    const [teamResult, inviteResult, branchResult] = await Promise.all([
       api.get("/api/team"),
-      api.get("/api/invitations")
+      api.get("/api/invitations"),
+      api.get("/api/branches")
     ]);
     setTeam(teamResult.data);
     setInvitations(inviteResult.data);
+    setBranches(branchResult.data);
+    setBranchId((current) => current || (branchResult.data[0] ? String(branchResult.data[0].id) : ""));
   }
 
   useEffect(() => {
@@ -2224,9 +2457,14 @@ function TeamAccess() {
     setMessage("");
     setIssuedCodes([]);
     try {
-      const { data } = await api.post("/api/invitations", { role, count: Number(count) });
+      const { data } = await api.post("/api/invitations", {
+        role,
+        count: Number(count),
+        branch_id: Number(branchId),
+        activation_status: activationStatus
+      });
       setIssuedCodes(data.invitations.map((item) => item.code));
-      setMessage(`${data.invitations.length} invitation code${data.invitations.length === 1 ? "" : "s"} created for ${role}.`);
+      setMessage(`${data.invitations.length} ${activationStatus.toLowerCase()} invitation code${data.invitations.length === 1 ? "" : "s"} created for ${role}.`);
       await refreshAccess();
     } catch (requestError) {
       setError(requestError.message || "Unable to create invitation.");
@@ -2249,10 +2487,11 @@ function TeamAccess() {
     setError("");
     setMessage("");
     try {
+      const member = team.find((item) => item.id === memberId);
       const { data } = await api.post(`/api/team/${memberId}/approve`, {
-        role: approvalRoles[memberId] || "Cashier"
+        branch_id: Number(approvalBranches[memberId] || member.branch_id || branchId)
       });
-      setMessage(`${data.user.full_name} approved as ${data.user.role}.`);
+      setMessage(data.message);
       await refreshAccess();
     } catch (requestError) {
       setError(requestError.message || "Unable to approve account.");
@@ -2261,11 +2500,26 @@ function TeamAccess() {
     }
   }
 
+  async function revokeInvitation(invitationId) {
+    setRevokingId(invitationId);
+    setError("");
+    setMessage("");
+    try {
+      await api.post(`/api/invitations/${invitationId}/revoke`, {});
+      setMessage("Invitation revoked. Its code can no longer be used.");
+      await refreshAccess();
+    } catch (requestError) {
+      setError(requestError.message || "Unable to revoke invitation.");
+    } finally {
+      setRevokingId(null);
+    }
+  }
+
   return (
     <>
       <SectionHeading
         title="Team Access"
-        description="Invite staff, approve account requests, and manage role-based access."
+        description="Manage organization-scoped invitations and activate staff using the credentials they created."
       />
       <section className="team-access-layout">
         <div className="panel">
@@ -2280,10 +2534,21 @@ function TeamAccess() {
             <div className="form-grid single">
               <Field label="Account role">
                 <select value={role} onChange={(event) => setRole(event.target.value)}>
+                  <option value="Admin">Organization Admin</option>
                   <option value="Cashier">Cashier</option>
                   <option value="Loan Officer">Loan Officer</option>
                   <option value="Inventory Manager">Inventory Manager</option>
-                  <option value="Super Admin">Administrator</option>
+                </select>
+              </Field>
+              <Field label="Branch">
+                <select value={branchId} onChange={(event) => setBranchId(event.target.value)} required>
+                  {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
+                </select>
+              </Field>
+              <Field label="Activation">
+                <select value={activationStatus} onChange={(event) => setActivationStatus(event.target.value)}>
+                  <option value="Pending">Pending approval</option>
+                  <option value="Active">Active immediately</option>
                 </select>
               </Field>
               <Field label="Number of codes (1–50)">
@@ -2298,7 +2563,7 @@ function TeamAccess() {
             {issuedCodes.length ? (
               <div className="issued-code" role="status">
                 <div>
-                  <span className="compact muted">Share each single-use code with its invited person. Codes expire in 24 hours and are shown only once.</span>
+                  <span className="compact muted">Share each single-use code with its invited person. Codes expire in 24 hours and are shown only once. Their password becomes their account credential at signup.</span>
                   <ul className="issued-code__list">{issuedCodes.map((code) => <li key={code}><strong>{code}</strong></li>)}</ul>
                 </div>
                 <button className="ghost-button" type="button" onClick={copyInvitation}>
@@ -2312,15 +2577,23 @@ function TeamAccess() {
         </div>
         <div className="panel">
           <div className="panel-header">
-            <h2>Pending invitations</h2>
-            <Badge tone="pending">{invitations.length} available</Badge>
+            <h2>Invitation codes</h2>
+            <Badge tone="pending">{invitations.filter((item) => item.status === "Available").length} available</Badge>
           </div>
           {invitations.length ? (
             <div className="panel-body invitation-list">
               {invitations.map((invitation) => (
                 <div className="invitation-row" key={invitation.id}>
-                  <div><strong>{invitation.role === "Super Admin" ? "Administrator" : invitation.role}</strong><span>Expires {formatDate(invitation.expires_at)}</span></div>
-                  <Badge tone="pending">Unused</Badge>
+                <div>
+                  <strong>{invitation.role === "Admin" ? "Organization Admin" : invitation.role}</strong>
+                  <span>{branches.find((branch) => branch.id === invitation.branch_id)?.name || "Branch unavailable"} · {invitation.activation_status === "Active" ? "Active immediately" : "Approval required"} · Expires {formatDate(invitation.expires_at)}</span>
+                </div>
+                <Badge tone={invitation.status}>{invitation.status}</Badge>
+                {invitation.status === "Available" ? (
+                  <button className="ghost-button" type="button" disabled={revokingId === invitation.id} onClick={() => revokeInvitation(invitation.id)}>
+                    <Icon name="ban" />{revokingId === invitation.id ? "Revoking..." : "Revoke"}
+                  </button>
+                ) : null}
                 </div>
               ))}
             </div>
@@ -2334,7 +2607,7 @@ function TeamAccess() {
           <div className="panel-body table-wrap">
             <table className="data-table">
               <thead>
-                <tr><th>Name</th><th>Staff ID</th><th>Email</th><th>Role</th><th>Status</th><th>Action</th></tr>
+                <tr><th>Name</th><th>Staff ID</th><th>Email</th><th>Role</th><th>Branch</th><th>Status</th><th>Action</th></tr>
               </thead>
               <tbody>
                 {team.map((member) => (
@@ -2342,19 +2615,20 @@ function TeamAccess() {
                     <td><strong>{member.full_name}</strong></td>
                     <td><span className="team-id">{member.employee_id || "Not assigned"}</span></td>
                     <td>{member.email}</td>
-                    <td>{member.role === "Super Admin" ? "Administrator" : member.role}</td>
+                    <td>{member.role === "Admin" ? "Organization Admin" : member.role}</td>
+                    <td>{branches.find((branch) => branch.id === member.branch_id)?.name || "Unassigned"}</td>
                     <td><Badge tone={member.status}>{member.status}</Badge></td>
                     <td>
                       {member.status === "Pending" ? (
                         <div className="team-approval-actions">
                           <select
-                            aria-label={`Role for ${member.full_name}`}
-                            value={approvalRoles[member.id] || "Cashier"}
-                            onChange={(event) => setApprovalRoles({ ...approvalRoles, [member.id]: event.target.value })}
+                            className="branch-select"
+                            aria-label={`Branch for ${member.full_name}`}
+                            value={approvalBranches[member.id] || member.branch_id || branchId}
+                            disabled={Boolean(member.branch_id)}
+                            onChange={(event) => setApprovalBranches({ ...approvalBranches, [member.id]: event.target.value })}
                           >
-                            <option value="Cashier">Cashier</option>
-                            <option value="Loan Officer">Loan Officer</option>
-                            <option value="Inventory Manager">Inventory Manager</option>
+                            {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
                           </select>
                           <button className="primary-button" type="button" disabled={approvingId === member.id} onClick={() => approveAccount(member.id)}>
                             {approvingId === member.id ? "Approving..." : "Approve"}
@@ -2364,7 +2638,7 @@ function TeamAccess() {
                     </td>
                   </tr>
                 ))}
-                {!team.length ? <tr><td colSpan="6">No team accounts found.</td></tr> : null}
+                {!team.length ? <tr><td colSpan="7">No team accounts found.</td></tr> : null}
               </tbody>
             </table>
           </div>
@@ -2448,7 +2722,7 @@ function SettingsPanel({ title, icon, section, values, fields, onChange, onSave,
   );
 }
 
-function AppShell({ session, onLogout, onAccountUpdated, theme, onToggleTheme }) {
+function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme, onToggleTheme }) {
   const [activeView, setActiveView] = useState("dashboard");
   const [search, setSearch] = useState("");
   const [summary, setSummary] = useState(null);
@@ -2462,7 +2736,7 @@ function AppShell({ session, onLogout, onAccountUpdated, theme, onToggleTheme })
   async function refreshData() {
     const settingsResult = await api.get("/api/settings");
     const modules = settingsResult.data.security.permissions[session.user.role] || [];
-    const canAccess = (moduleName) => session.user.role === "Super Admin" || modules.includes(moduleName);
+    const canAccess = (moduleName) => ["Admin", "Super Admin"].includes(session.user.role) || modules.includes(moduleName);
     const [summaryResult, customersResult, loansResult, paymentsResult, inventoryResult, agreementsResult] = await Promise.all([
       api.get("/api/summary"),
       canAccess("customers") ? api.get("/api/customers") : Promise.resolve({ data: [] }),
@@ -2482,7 +2756,7 @@ function AppShell({ session, onLogout, onAccountUpdated, theme, onToggleTheme })
 
   useEffect(() => {
     refreshData();
-  }, []);
+  }, [session.support_override ? session.support_override.organization_id : null]);
 
   const viewProps = {
     summary,
@@ -2500,21 +2774,23 @@ function AppShell({ session, onLogout, onAccountUpdated, theme, onToggleTheme })
 
   const permissions = settings.security.permissions[session.user.role] || [];
   const visibleNav = navItems.filter((item) =>
-    session.user.role === "Super Admin"
+    session.user.role === "Super Admin" && !session.support_override
+      ? item.id === "dashboard"
+      : session.user.role === "Super Admin"
       ? item.roles.includes(session.user.role)
-      : item.id === "dashboard" || permissions.includes(item.id)
+      : item.id === "dashboard" || item.roles.includes(session.user.role) || permissions.includes(item.id)
   );
   useEffect(() => {
     if (!visibleNav.some((item) => item.id === activeView)) {
       setActiveView("dashboard");
     }
-  }, [session.user.role, settings.security.permissions]);
+  }, [session.user.role, session.support_override, settings.security.permissions]);
 
   return (
     <div className="app-shell">
-      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} />
+      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} supportOverride={session.support_override} />
       <div className="workspace">
-        <Topbar user={session.user} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} onAccountUpdated={onAccountUpdated} />
+        <Topbar user={session.user} session={session} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} onAccountUpdated={onAccountUpdated} onSessionUpdated={onSessionUpdated} />
         <main className="main-content">
           {activeView === "dashboard" ? <Dashboard {...viewProps} /> : null}
           {activeView === "customers" ? <CustomerManagement {...viewProps} /> : null}
@@ -2538,7 +2814,7 @@ function App() {
     try {
       const restored = JSON.parse(saved);
       if (!restored.expires_at || new Date(restored.expires_at).getTime() <= Date.now()) return null;
-      return { user: restored.user, expires_at: restored.expires_at };
+      return { user: restored.user, expires_at: restored.expires_at, support_override: restored.support_override || null };
     } catch (error) {
       console.error("Could not restore the saved session:", error);
       return null;
@@ -2568,7 +2844,11 @@ function App() {
     api.get("/api/session")
       .then(({ data }) => {
         if (!active) return;
-        const restoredSession = { user: data.user, expires_at: data.expires_at };
+        const restoredSession = {
+          user: data.user,
+          expires_at: data.expires_at,
+          support_override: data.support_override || null
+        };
         window.sessionStorage.setItem("draman-session", JSON.stringify(restoredSession));
         setSession(restoredSession);
       })
@@ -2606,7 +2886,11 @@ function App() {
   }, [session]);
 
   function handleLogin(nextSession) {
-    const savedSession = { user: nextSession.user, expires_at: nextSession.expires_at };
+    const savedSession = {
+      user: nextSession.user,
+      expires_at: nextSession.expires_at,
+      support_override: nextSession.support_override || null
+    };
     window.sessionStorage.setItem("draman-session", JSON.stringify(savedSession));
     setAuthNotice("");
     setSession(savedSession);
@@ -2614,9 +2898,23 @@ function App() {
 
   function handleAccountUpdated(user) {
     if (!session) return;
-    const updatedSession = { user, expires_at: session.expires_at };
+    const updatedSession = {
+      user,
+      expires_at: session.expires_at,
+      support_override: session.support_override || null
+    };
     window.sessionStorage.setItem("draman-session", JSON.stringify(updatedSession));
     setSession(updatedSession);
+  }
+
+  function handleSessionUpdated(nextSession) {
+    const savedSession = {
+      user: nextSession.user,
+      expires_at: nextSession.expires_at,
+      support_override: nextSession.support_override || null
+    };
+    window.sessionStorage.setItem("draman-session", JSON.stringify(savedSession));
+    setSession(savedSession);
   }
 
   async function handleLogout() {
@@ -2640,7 +2938,7 @@ function App() {
     return <LoginScreen onLogin={handleLogin} theme={theme} onToggleTheme={toggleTheme} initialMessage={authNotice} />;
   }
 
-  return <AppShell session={session} onLogout={handleLogout} onAccountUpdated={handleAccountUpdated} theme={theme} onToggleTheme={toggleTheme} />;
+  return <AppShell session={session} onLogout={handleLogout} onAccountUpdated={handleAccountUpdated} onSessionUpdated={handleSessionUpdated} theme={theme} onToggleTheme={toggleTheme} />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);

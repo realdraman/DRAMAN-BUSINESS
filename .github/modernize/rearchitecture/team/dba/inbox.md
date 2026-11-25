@@ -1,0 +1,1 @@
+2026-11-24T00:59:47.2857257+03:00 [t1.1-devops] [notify:dba] HIGH: schema.sql stops at line 35 because employee_id is undefined in UNIQUE (organization_id, employee_id); RLS policies are not reached and live tenant-isolation verification remains blocked.

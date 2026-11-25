@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Executable implementation tasks for PostgreSQL persistence, authentication hardening, Vercel production serving, and focused security verification.",
+  "tasks": [
+    {
+      "type": "transform",
+      "id": "001-transform-postgresql-persistence-auth-tenancy",
+      "description": "Replace local JSON storage with secure PostgreSQL-backed persistence",
+      "reason": "The current JSON files are not durable or shared across Vercel instances and cannot provide transactional guarantees or database-enforced tenant isolation.",
+      "requirements": "Replace JSON account and business-data persistence with PostgreSQL queries through the pg package and DATABASE_URL. Require SSL/TLS for hosted database connections and fail clearly when production configuration is missing; provide an injectable mock/test pool for local automated tests. Align schema.sql with the runtime data model, ensure it is valid and includes organization/branch constraints, effective RLS and least-privilege behavior or strict tenant-scoped queries for every tenant-owned operation, and support-override audit protections. Use bcrypt for password hashing and comparison, preserving secure behavior for existing account records through an explicit compatible migration or reset path. Redeem invitations and create the user in one transaction with concurrency-safe single-use enforcement and rollback on failure. Persist support-override start, accepted writes, and end events with actor, organization/scope, reason, and request details. Add .env.example and README instructions for configuring a hosted PostgreSQL URL and SSL without committing credentials. Add mock/test-pool tests for persistence, authentication, tenant isolation, invite concurrency/rollback, audit behavior, and error handling; do not require live hosted credentials.",
+      "successCriteria": {
+        "passBuild": "true",
+        "generateNewUnitTests": "true",
+        "passUnitTests": "true"
+      }
+    },
+    {
+      "type": "transform",
+      "id": "002-transform-vercel-production-serving",
+      "description": "Make the application and its API reliable on Vercel",
+      "reason": "Production requests must reach the same-origin API and static application through Vercel's serverless routing without cross-origin credential failures.",
+      "requirements": "Keep all browser API requests on relative same-origin /api paths and verify no production API call depends on localhost or a hard-coded host. Adapt the Express application for Vercel's serverless function export and start a listener only for local development. Update vercel.json rewrites/function configuration so the root/index and required static assets resolve correctly alongside API routes. Replace wildcard CORS with an explicit same-origin/allowlist policy that handles preflight and credentialed requests safely; retain secure session-cookie behavior. Add tests or smoke checks for local startup, Vercel-style exported handler behavior, index/static asset responses, API routing, OPTIONS preflight, and credential/CORS headers.",
+      "dependencies": [
+        "001-transform-postgresql-persistence-auth-tenancy"
+      ],
+      "successCriteria": {
+        "passBuild": "true",
+        "generateNewUnitTests": "true",
+        "passUnitTests": "true"
+      }
+    },
+    {
+      "type": "security",
+      "id": "003-security-dependency-cve-review",
+      "description": "Review and remediate known vulnerabilities in the application dependencies",
+      "reason": "The database and serverless changes introduce or update runtime dependencies that should be checked before release.",
+      "requirements": "Scan the project's Node.js dependency set, including dependencies introduced for PostgreSQL, bcrypt, and Express, for known CVEs. Upgrade affected packages to patched compatible versions, documenting any unavoidable major-version risk, then run the build and complete test suite. Keep remediation limited to dependencies in this application's dependency graph.",
+      "dependencies": [
+        "001-transform-postgresql-persistence-auth-tenancy",
+        "002-transform-vercel-production-serving"
+      ],
+      "successCriteria": {
+        "passBuild": "true",
+        "generateNewUnitTests": "false",
+        "passUnitTests": "true"
+      }
+    }
+  ],
+  "metadata": {
+    "planName": "postgres-vercel-production-readiness",
+    "projectName": "DRAMAN Loan Services Management System",
+    "language": "javascript",
+    "createdAt": "2026-11-24T00:02:00.115+03:00",
+    "version": "1.0"
+  }
+}

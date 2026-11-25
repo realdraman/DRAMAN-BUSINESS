@@ -1,10 +1,9 @@
-const http = require("node:http");
+const express = require("express");
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const { URL } = require("node:url");
-const { promisify } = require("node:util");
-const os = require("node:os");
+const bcrypt = require("bcryptjs");
+const { pool } = require("./db");
 
 const PORT = Number(process.env.PORT || 4173);
 const isProduction = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
@@ -12,21 +11,27 @@ const sessionSecret = process.env.SESSION_SECRET || (isProduction ? "" : crypto.
 if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
   throw new Error("Set SESSION_SECRET to a secret of at least 32 bytes before starting in production.");
 }
-const sessionCookieName = "draman_session";
-const scrypt = promisify(crypto.scrypt);
-const defaultDataDir = process.env.LOCALAPPDATA
-  ? path.join(process.env.LOCALAPPDATA, "DRAMAN Loan Services")
-  : process.platform === "darwin"
-    ? path.join(os.homedir(), "Library", "Application Support", "DRAMAN Loan Services")
-    : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "draman-loan-services");
-const privateDataDir = path.resolve(
-  process.env.DRAMAN_DATA_DIR || (process.env.VERCEL ? "/tmp/private-data" : defaultDataDir)
-);
-const authStorePath = path.join(privateDataDir, "auth-store.json");
-const adminCredentialsPath = path.join(privateDataDir, "admin-credentials.json");
-const businessDataPath = path.join(privateDataDir, "business-data.json");
-const bootstrapCredentialsPath = path.join(privateDataDir, "first-admin-credentials.txt");
-const passwordResetOutboxPath = path.join(privateDataDir, "password-reset-outbox");
+
+const SESSION_COOKIE = "draman_session";
+const allowedRoles = ["Admin", "Cashier", "Loan Officer", "Inventory Manager"];
+const staffRoles = ["Cashier", "Loan Officer", "Inventory Manager"];
+const allowedProductCategories = [
+  "Furniture", "Electronics", "Phones", "TVs", "Woofers", "Gas cylinders",
+  "Household items", "Office furniture"
+];
+const defaultPermissions = {
+  "Loan Officer": ["dashboard", "customers", "loans", "payments", "reports", "agreements"],
+  Cashier: ["dashboard", "payments", "reports"],
+  "Inventory Manager": ["dashboard", "inventory", "reports"]
+};
+const defaultSettings = {
+  security: {
+    session_timeout_hours: 24,
+    minimum_password_length: 10,
+    require_unique_staff_ids: true,
+    audit_logging_enabled: true
+  }
+};
 const publicFiles = {
   "/": "index.html",
   "/index.html": "index.html",
@@ -34,248 +39,76 @@ const publicFiles = {
   "/styles.css": "styles.css",
   "/draman-logo.svg": "draman-logo.svg"
 };
-
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".jsx": "text/babel; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".ico": "image/x-icon"
+  ".svg": "image/svg+xml"
 };
 
-const todayIso = () => new Date().toISOString();
-const dateOnly = (date) => new Date(date).toISOString().slice(0, 10);
-const money = (value) => Number.parseFloat(value || 0);
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "2mb" }));
+app.use((req, res, next) => {
+  req.body = req.body || {};
+  next();
+});
 
-const db = {
-  users: [],
-  customers: [],
-  guarantors: [],
-  loans: [],
-  payments: [],
-  penalties: [],
-  inventory: [
-    {
-      id: 1,
-      product_name: "Office Desk",
-      category: "Office furniture",
-      quantity: 8,
-      buying_price: 9000,
-      selling_price: 13500,
-      description: "Sturdy office desk suitable for home offices, loan offices, or small retail counters.",
-      condition: "Second-hand good",
-      serial_number: "FUR-OD-001",
-      image: "",
-      created_at: "2026-03-14T08:00:00.000Z"
-    },
-    {
-      id: 2,
-      product_name: "Samsung 43 inch TV",
-      category: "TVs",
-      quantity: 2,
-      buying_price: 21000,
-      selling_price: 29500,
-      description: "Clear display television with tested ports, remote support, and installment-sale potential.",
-      condition: "Used excellent",
-      serial_number: "TV-SAM-043",
-      image: "",
-      created_at: "2026-04-02T08:00:00.000Z"
-    },
-    {
-      id: 3,
-      product_name: "Gas Cylinder 13kg",
-      category: "Gas cylinders",
-      quantity: 1,
-      buying_price: 5200,
-      selling_price: 7600,
-      description: "Refurbished 13kg gas cylinder inspected for household resale and quick turnover.",
-      condition: "Refurbished",
-      serial_number: "GAS-13-091",
-      image: "",
-      created_at: "2026-04-10T08:00:00.000Z"
-    },
-    {
-      id: 4,
-      product_name: "Three-Seater Sofa",
-      category: "Furniture",
-      quantity: 5,
-      buying_price: 18000,
-      selling_price: 26500,
-      description: "Comfortable three-seater sofa for living rooms, staged for direct or installment purchase.",
-      condition: "Second-hand good",
-      serial_number: "SOFA-3S-022",
-      image: "",
-      created_at: "2026-04-16T08:00:00.000Z"
-    }
-  ],
-  sales: [],
-  agreements: [],
-  activity_logs: [],
-  settings: {
-    business: {
-      company_name: "DRAMAN Loan Services",
-      logo_data: "",
-      contact_phone: "",
-      contact_email: "",
-      receipt_footer: "Thank you for your payment.",
-      sms_enabled: true,
-      sms_sender_id: ""
-    },
-    loan: {
-      default_interest_rate: 12,
-      processing_fee: 1000,
-      grace_period_days: 0,
-      late_penalty_rate: 3,
-      approval_threshold: 100000
-    },
-    security: {
-      session_timeout_hours: 24,
-      minimum_password_length: 10,
-      require_unique_staff_ids: true,
-      backup_schedule: "Daily",
-      audit_logging_enabled: true,
-      permissions: {
-        "Loan Officer": ["dashboard", "customers", "loans", "payments", "reports", "agreements"],
-        Cashier: ["dashboard", "payments", "reports"],
-        "Inventory Manager": ["dashboard", "inventory", "reports"]
-      }
-    }
+function reply(res, status, data) {
+  res.set("Cache-Control", "no-store");
+  res.status(status).json(data);
+}
+
+function fail(res, status, message, code) {
+  reply(res, status, { message, ...(code ? { code } : {}) });
+}
+
+function databaseUnavailable(res) {
+  return fail(res, 503, "PostgreSQL is not configured. This endpoint requires DATABASE_URL.");
+}
+
+function requirePool(res) {
+  if (!pool) {
+    databaseUnavailable(res);
+    return false;
   }
-};
-
-const allowedRoles = ["Super Admin", "Cashier", "Loan Officer", "Inventory Manager"];
-let authStoreWrite = Promise.resolve();
-let businessDataWrite = Promise.resolve();
-let passwordResetTokens = [];
-db.invitations = [];
-
-async function ensurePrivateDataDir() {
-  await fs.mkdir(privateDataDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await fs.chmod(privateDataDir, 0o700);
+  return true;
 }
 
-async function writePrivateFile(filePath, contents) {
-  await ensurePrivateDataDir();
-  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await fs.chmod(path.dirname(filePath), 0o700);
-  await fs.writeFile(filePath, contents, { encoding: "utf8", mode: 0o600 });
-  if (process.platform !== "win32") await fs.chmod(filePath, 0o600);
+async function transaction(callback) {
+  if (!pool) throw new Error("PostgreSQL is not configured.");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await callback(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Could not roll back PostgreSQL transaction:", rollbackError.message);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-function saveAuthStore() {
-  authStoreWrite = authStoreWrite.catch(() => {}).then(async () => {
-    await writePrivateFile(authStorePath, JSON.stringify({
-      users: db.users,
-      invitations: db.invitations,
-      password_reset_tokens: passwordResetTokens
-    }));
+async function setContext(client, { organizationId = null, userId = null, globalReadOnly = true, platformOverride = false, supportOverride = false } = {}) {
+  await client.query("SELECT set_config('app.global_read_only', $1, true)", [globalReadOnly ? "true" : "false"]);
+  await client.query("SELECT set_config('app.organization_id', $1, true)", [organizationId == null ? "" : String(organizationId)]);
+  await client.query("SELECT set_config('app.user_id', $1, true)", [userId == null ? "" : String(userId)]);
+  await client.query("SELECT set_config('app.platform_override', $1, true)", [platformOverride ? "true" : "false"]);
+  await client.query("SELECT set_config('app.support_override', $1, true)", [supportOverride ? "true" : "false"]);
+}
+
+async function readQuery(query, values = [], context = {}) {
+  return transaction(async (client) => {
+    await setContext(client, context);
+    return client.query(query, values);
   });
-  return authStoreWrite;
-}
-
-function saveBusinessData() {
-  businessDataWrite = businessDataWrite.catch(() => {}).then(async () => {
-    const data = { ...db, users: undefined, invitations: undefined };
-    await writePrivateFile(businessDataPath, JSON.stringify(data));
-  });
-  return businessDataWrite;
-}
-
-async function loadPrivateData() {
-  await ensurePrivateDataDir();
-  try {
-    const savedBusinessData = JSON.parse(await fs.readFile(businessDataPath, "utf8"));
-    for (const [key, value] of Object.entries(savedBusinessData)) {
-      if (key !== "users" && key !== "invitations" && Object.prototype.hasOwnProperty.call(db, key)) {
-        db[key] = value;
-      }
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") throw new Error(`Could not load private business data: ${error.message}`);
-  }
-
-  try {
-    const savedAuthData = JSON.parse(await fs.readFile(authStorePath, "utf8"));
-    if (!Array.isArray(savedAuthData.users) || !Array.isArray(savedAuthData.invitations) ||
-      !Array.isArray(savedAuthData.password_reset_tokens)) {
-      throw new Error("Private account data has an invalid format.");
-    }
-    db.users = savedAuthData.users;
-    db.invitations = savedAuthData.invitations;
-    passwordResetTokens = savedAuthData.password_reset_tokens;
-    return;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw new Error(`Could not load private account data: ${error.message}`);
-  }
-
-  let privateBootstrap = null;
-  try {
-    privateBootstrap = JSON.parse(await fs.readFile(adminCredentialsPath, "utf8"));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw new Error(`Could not read private administrator credentials: ${error.message}`);
-  }
-  if (privateBootstrap && (
-    typeof privateBootstrap.email !== "string" ||
-    typeof privateBootstrap.password !== "string" ||
-    !validEmail(privateBootstrap.email.trim().toLowerCase()) ||
-    privateBootstrap.password.length < 1 ||
-    privateBootstrap.password.length > 128
-  )) {
-    throw new Error("Private administrator credentials must contain a valid email and a password of 1 to 128 characters.");
-  }
-
-  const initialEmail = String(
-    process.env.DRAMAN_ADMIN_EMAIL || (privateBootstrap && privateBootstrap.email) || "admin@draman.co.ke"
-  ).trim().toLowerCase();
-  const configuredPassword = process.env.DRAMAN_ADMIN_PASSWORD || (privateBootstrap && privateBootstrap.password);
-  const initialPassword = configuredPassword || crypto.randomBytes(24).toString("base64url");
-  if (!validEmail(initialEmail)) throw new Error("DRAMAN_ADMIN_EMAIL must be a valid email address.");
-  db.users = [{
-    id: 1,
-    full_name: "Administrator",
-    email: initialEmail,
-    employee_id: "ADM-001",
-    phone: "",
-    role: "Super Admin",
-    status: "Active",
-    session_version: 0,
-    password_hash: await hashPassword(initialPassword),
-    created_at: todayIso()
-  }];
-  passwordResetTokens = [];
-  await saveAuthStore();
-  if (privateBootstrap) {
-    await fs.unlink(adminCredentialsPath);
-    if (initialPassword.length < db.settings.security.minimum_password_length) {
-      console.warn("The configured initial administrator password is shorter than the password policy. Change it after signing in.");
-    }
-    console.log("Created the initial administrator account from private credentials.");
-    return;
-  }
-  await writePrivateFile(
-    bootstrapCredentialsPath,
-    `Initial administrator sign-in\nEmail: ${db.users[0].email}\nPassword: ${initialPassword}\n\nChange this password and email after signing in. This file is stored outside the project folder and should be deleted after use.\n`
-  );
-  console.log(`Created the initial administrator account. Read credentials from: ${bootstrapCredentialsPath}`);
-}
-
-async function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
-  const hash = (await scrypt(password, salt, 64)).toString("hex");
-  return `${salt}:${hash}`;
-}
-
-async function verifyPassword(password, storedHash) {
-  if (!storedHash) return false;
-  const [salt, expectedHex] = storedHash.split(":");
-  if (!salt || !expectedHex) return false;
-  const expected = Buffer.from(expectedHex, "hex");
-  const actual = await scrypt(password, salt, expected.length);
-  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
 function publicUser(user) {
@@ -283,26 +116,55 @@ function publicUser(user) {
   return safeUser;
 }
 
-function publicInvitation(invitation) {
-  const { code_hash, ...safeInvitation } = invitation;
-  return safeInvitation;
+function validEmail(value) {
+  return typeof value === "string" && value.length <= 180 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
-function readCookie(request, name) {
-  const cookieHeader = request.headers.cookie || "";
-  for (const pair of cookieHeader.split(";")) {
-    const separator = pair.indexOf("=");
-    if (separator < 0) continue;
-    if (pair.slice(0, separator).trim() === name) return pair.slice(separator + 1).trim();
+function effectiveSettings(organization) {
+  const settings = organization && organization.settings && typeof organization.settings === "object"
+    ? organization.settings
+    : {};
+  return {
+    ...defaultSettings,
+    ...settings,
+    security: { ...defaultSettings.security, ...(settings.security || {}) }
+  };
+}
+
+function hashInvitation(code) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+function invitationStatus(row) {
+  const { code_hash, ...safeInvitation } = row;
+  const status = row.revoked_at
+    ? "Revoked"
+    : row.used_at
+      ? "Used"
+      : new Date(row.expires_at) <= new Date()
+        ? "Expired"
+        : "Available";
+  return { ...safeInvitation, status };
+}
+
+function readCookie(req, name) {
+  const cookies = String(req.headers.cookie || "").split(";");
+  for (const cookie of cookies) {
+    const separator = cookie.indexOf("=");
+    if (separator >= 0 && cookie.slice(0, separator).trim() === name) {
+      return cookie.slice(separator + 1).trim();
+    }
   }
   return "";
 }
 
-function signSession(user, expiresAt) {
+function signSession(user, expiresAt, supportOverride = null) {
   const payload = Buffer.from(JSON.stringify({
-    user_id: user.id,
+    user_id: Number(user.id),
     expires_at: expiresAt,
-    session_version: Number.isSafeInteger(user.session_version) ? user.session_version : 0
+    session_version: Number(user.session_version || 0),
+    support_override: supportOverride
   })).toString("base64url");
   const signature = crypto.createHmac("sha256", sessionSecret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
@@ -310,1096 +172,1866 @@ function signSession(user, expiresAt) {
 
 function verifySession(token) {
   const parts = token.split(".");
-  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-  const [payload, signature] = parts;
-  const expected = crypto.createHmac("sha256", sessionSecret).update(payload).digest();
-  const received = Buffer.from(signature, "base64url");
-  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
+  if (parts.length !== 2) return null;
+  const expected = crypto.createHmac("sha256", sessionSecret).update(parts[0]).digest();
+  const supplied = Buffer.from(parts[1], "base64url");
+  if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) return null;
   try {
-    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const session = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
     if (!Number.isSafeInteger(session.user_id) || !Number.isSafeInteger(session.expires_at) ||
       !Number.isSafeInteger(session.session_version)) return null;
     return session;
-  } catch (error) {
+  } catch {
     return null;
   }
 }
 
-function sessionCookie(value, expiresAt) {
+function setSessionCookie(res, user, expiresAt, supportOverride = null) {
+  const secure = isProduction ? "; Secure" : "";
   const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  const value = signSession(user, expiresAt, supportOverride);
+  res.set("Set-Cookie", `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}; Expires=${new Date(expiresAt).toUTCString()}${secure}`);
+}
+
+function clearSessionCookie(res) {
   const secure = isProduction ? "; Secure" : "";
-  return `${sessionCookieName}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}; Expires=${new Date(expiresAt).toUTCString()}${secure}`;
+  res.set("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure}`);
 }
 
-function clearSessionCookie() {
-  const secure = isProduction ? "; Secure" : "";
-  return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure}`;
-}
-
-function expireUserSessions(user) {
-  user.session_version = (Number.isSafeInteger(user.session_version) ? user.session_version : 0) + 1;
-}
-
-function sessionUser(request) {
-  const token = readCookie(request, sessionCookieName);
-  const session = verifySession(token);
-  if (!session || session.expires_at <= Date.now()) return null;
-  const user = db.users.find((item) => item.id === session.user_id && item.status === "Active");
-  const currentVersion = user && Number.isSafeInteger(user.session_version) ? user.session_version : 0;
-  if (!user || session.session_version !== currentVersion) return null;
-  request.authUser = user;
-  request.sessionExpiresAt = session.expires_at;
-  return user;
-}
-
-function nextId(collection) {
-  return collection.reduce((max, row) => Math.max(max, row.id), 0) + 1;
-}
-
-function nextCode(prefix, collection, field) {
-  const year = new Date().getFullYear();
-  const count = collection.length + 1;
-  return `${prefix}-${year}-${String(count).padStart(3, "0")}`;
-}
-
-function sendJson(response, status, data) {
-  const finish = (responseStatus, responseData) => {
-    const headers = {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS"
-    };
-    if (response.sessionCookie) headers["Set-Cookie"] = response.sessionCookie;
-    response.writeHead(responseStatus, headers);
-    response.end(JSON.stringify(responseData));
-  };
-  if (response.persistData && status >= 200 && status < 300) {
-    saveBusinessData()
-      .then(() => finish(status, data))
-      .catch((error) => {
-        console.error("Could not save private business data:", error);
-        finish(500, { message: "Could not securely save the latest data. Check server storage permissions." });
-      });
-    return;
-  }
-  finish(status, data);
-}
-
-function isSuperAdminRequest(request) {
-  return request.authUser && request.authUser.role === "Super Admin";
-}
-
-function requireSuperAdmin(request, response) {
-  if (isSuperAdminRequest(request)) return true;
-  sendJson(response, 403, { message: "Super Admin permission required" });
-  return false;
-}
-
-function requireModule(request, response, moduleName) {
-  if (request.authUser && (request.authUser.role === "Super Admin" ||
-    (db.settings.security.permissions[request.authUser.role] || []).includes(moduleName))) return true;
-  sendJson(response, 403, { message: "Your account does not have permission for this section" });
-  return false;
-}
-
-function removeCustomerLinks(customerId) {
-  const linkedLoanIds = db.loans
-    .filter((loan) => loan.customer_id === customerId)
-    .map((loan) => loan.id);
-  db.customers = db.customers.filter((customer) => customer.id !== customerId);
-  db.guarantors = db.guarantors.filter((guarantor) => guarantor.customer_id !== customerId);
-  db.loans = db.loans.filter((loan) => loan.customer_id !== customerId);
-  db.payments = db.payments.filter((payment) => payment.customer_id !== customerId);
-  db.penalties = db.penalties.filter((penalty) => !linkedLoanIds.includes(penalty.loan_id));
-  db.sales = db.sales.filter((sale) => sale.customer_id !== customerId);
-  db.agreements = db.agreements.filter((agreement) => agreement.customer_id !== customerId);
-}
-
-function clearCustomerData() {
-  db.customers = [];
-  db.guarantors = [];
-  db.loans = [];
-  db.payments = [];
-  db.penalties = [];
-  db.sales = [];
-  db.agreements = [];
-}
-
-function buildNotifications(user) {
-  const notifications = [];
-  const isAdmin = user.role === "Super Admin";
-  const permissions = db.settings.security.permissions[user.role] || [];
-  const canSeeLoans = isAdmin || permissions.includes("loans");
-  const canSeeInventory = isAdmin || permissions.includes("inventory");
-
-  if (isAdmin) {
-    const pendingAccounts = db.users.filter((item) => item.status === "Pending");
-    if (pendingAccounts.length) {
-      notifications.push({
-        id: "pending-accounts",
-        title: "Account requests",
-        message: `${pendingAccounts.length} account request${pendingAccounts.length === 1 ? "" : "s"} waiting for a role and approval.`,
-        level: "warning"
-      });
-    }
-    const pendingLoans = db.loans.filter((loan) => loan.status === "Pending");
-    if (pendingLoans.length) {
-      notifications.push({
-        id: "pending-loans",
-        title: "Loan approvals needed",
-        message: `${pendingLoans.length} loan application${pendingLoans.length === 1 ? "" : "s"} waiting for review.`,
-        level: "warning"
-      });
-    }
-  }
-
-  if (canSeeLoans) {
-    const overdueLoans = db.loans.filter((loan) => loan.balance > 0 && new Date(loan.due_date) < new Date());
-    if (overdueLoans.length) {
-      notifications.push({
-        id: "overdue-loans",
-        title: "Overdue loans",
-        message: `${overdueLoans.length} loan${overdueLoans.length === 1 ? "" : "s"} need follow-up.`,
-        level: "warning"
-      });
-    }
-  }
-
-  if (canSeeInventory) {
-    const lowStock = db.inventory.filter((item) => item.quantity <= 2);
-    if (lowStock.length) {
-      notifications.push({
-        id: "low-stock",
-        title: "Low stock alert",
-        message: `${lowStock.length} product${lowStock.length === 1 ? "" : "s"} have 2 or fewer items remaining.`,
-        level: "warning"
-      });
-    }
-  }
-
-  db.activity_logs.slice(0, 5).forEach((item) => {
-    notifications.push({
-      id: `activity-${item.id}`,
-      title: "Recent activity",
-      message: item.action,
-      level: "info",
-      created_at: item.created_at
-    });
+async function loadUser(userId) {
+  return transaction(async (client) => {
+    await setContext(client);
+    const { rows } = await client.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [userId]);
+    return rows[0] || null;
   });
-
-  return notifications.slice(0, 12);
 }
 
-async function parseBody(request) {
-  const chunks = [];
-  for await (const chunk of request) {
-    chunks.push(chunk);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    return {};
-  }
-}
-
-function validEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
-}
-
-function resetTokenKey(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-async function sendPasswordResetInstructions(user, resetToken, resetRecord) {
-  const publicUrl = String(process.env.DRAMAN_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
-  const resetUrl = new URL("/", publicUrl);
-  resetUrl.searchParams.set("reset_token", resetToken);
-  const message = `Reset your DRAMAN account password using this one-time link. It expires in one hour:\n\n${resetUrl.toString()}\n`;
-  if (process.env.RESEND_API_KEY && process.env.DRAMAN_EMAIL_FROM) {
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        from: process.env.DRAMAN_EMAIL_FROM,
-        to: [user.email],
-        subject: "Reset your DRAMAN account password",
-        text: message
-      })
-    });
-    if (!response.ok) throw new Error("The configured email provider could not send the reset message.");
+async function authenticate(req, res, next) {
+  const session = verifySession(readCookie(req, SESSION_COOKIE));
+  if (!session || session.expires_at <= Date.now() || !requirePool(res)) {
+    if (!session || session.expires_at <= Date.now()) {
+      clearSessionCookie(res);
+      return fail(res, 401, "Your session has expired. Please sign in again.");
+    }
     return;
   }
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("Password reset email delivery is not configured.");
+  try {
+    const user = await loadUser(session.user_id);
+    if (!user || user.status !== "Active" || Number(user.session_version || 0) !== session.session_version) {
+      clearSessionCookie(res);
+      return fail(res, 401, "Your session has expired. Please sign in again.");
+    }
+    if (user.organization_id != null) {
+      const { rows: organizations } = await readQuery(
+        "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
+        [user.organization_id]
+      );
+      const organization = organizations[0];
+      if (!organization || organization.status !== "Active") {
+        return fail(res, 403, "Your organization is inactive. Contact platform support.", "ORGANIZATION_INACTIVE");
+      }
+      user.organization = organization;
+      if (user.branch_id != null) {
+        const { rows: branches } = await readQuery(
+          "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 LIMIT 1",
+          [user.branch_id, user.organization_id]
+        );
+        user.branch = branches[0] || null;
+      }
+      if (user.role !== "Super Admin" && (!user.branch || user.branch.status !== "Active")) {
+        return fail(res, 403, "Your account is active but no branch is assigned. Contact your organization administrator.", "BRANCH_UNASSIGNED");
+      }
+    }
+    req.authUser = user;
+    req.supportOverride = session.support_override || null;
+    req.sessionExpiresAt = session.expires_at;
+    next();
+  } catch (error) {
+    console.error("Could not authenticate request against PostgreSQL:", error.message);
+    fail(res, 503, "Could not verify the session using PostgreSQL.");
   }
-  const fileName = `reset-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`;
-  resetRecord.outbox_file = fileName;
-  await writePrivateFile(path.join(passwordResetOutboxPath, fileName), `To: ${user.email}\n\n${message}`);
 }
 
-function publicCustomer(customerId) {
-  return db.customers.find((customer) => customer.id === Number(customerId));
+function isSuperAdmin(req) {
+  return req.authUser && req.authUser.role === "Super Admin";
 }
 
-function decoratedLoan(loan) {
-  const customer = publicCustomer(loan.customer_id);
-  return {
-    ...loan,
-    customer_name: customer ? customer.full_name : "Unknown customer",
-    customer_phone: customer ? customer.phone : ""
-  };
-}
-
-function decoratedPayment(payment) {
-  const customer = publicCustomer(payment.customer_id);
-  const loan = db.loans.find((item) => item.id === Number(payment.loan_id));
-  const receiver = db.users.find((item) => item.id === Number(payment.received_by));
-  return {
-    ...payment,
-    customer_name: customer ? customer.full_name : "Unknown customer",
-    customer_phone: customer ? customer.phone : "",
-    loan_code: loan ? loan.loan_code : "Unknown loan",
-    received_by_name: receiver ? receiver.full_name : "System"
-  };
-}
-
-function buildSummary() {
-  const now = new Date();
-  const currentDay = dateOnly(now);
-  const currentMonth = now.toISOString().slice(0, 7);
-  const activeLoans = db.loans.filter((loan) => ["Approved", "Active", "Defaulted"].includes(loan.status));
-  const collectedToday = db.payments
-    .filter((payment) => dateOnly(payment.payment_date) === currentDay)
-    .reduce((sum, payment) => sum + money(payment.amount_paid), 0);
-  const overdueLoans = db.loans.filter((loan) => loan.balance > 0 && new Date(loan.due_date) < now);
-  const inventoryStockValue = db.inventory.reduce(
-    (sum, item) => sum + money(item.quantity) * money(item.buying_price),
-    0
+async function auditOverride(client, req, action, override) {
+  const organizationId = override && override.scope === "organization" ? override.organization_id : null;
+  await setContext(client, {
+    organizationId,
+    globalReadOnly: true,
+    platformOverride: !organizationId,
+    supportOverride: Boolean(organizationId)
+  });
+  await client.query(
+    `INSERT INTO support_override_audit
+      (actor_user_id, organization_id, scope, reason, action, request_method, request_path)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      req.authUser.id,
+      organizationId,
+      override ? override.scope : "organization",
+      override ? override.reason : "",
+      action,
+      req.method,
+      new URL(req.originalUrl, "http://localhost").pathname
+    ]
   );
-  const monthlyCollections = db.payments
-    .filter((payment) => payment.payment_date.slice(0, 7) === currentMonth)
-    .reduce((sum, payment) => sum + money(payment.amount_paid), 0);
-  const monthlyFees = db.loans
-    .filter((loan) => loan.created_at.slice(0, 7) === currentMonth)
-    .reduce((sum, loan) => sum + money(loan.processing_fee), 0);
-  const repaymentSeries = Array.from({ length: 5 }, (_, index) => {
-    const monthDate = new Date(now.getFullYear(), index, 1);
-    const monthKey = `${now.getFullYear()}-${String(index + 1).padStart(2, "0")}`;
-    return {
-      label: monthDate.toLocaleString("en", { month: "short" }),
-      amount: db.payments
-        .filter((payment) => payment.payment_date.slice(0, 7) === monthKey)
-        .reduce((sum, payment) => sum + money(payment.amount_paid), 0)
-    };
-  });
-
-  return {
-    cards: {
-      totalActiveLoans: activeLoans.length,
-      amountCollectedToday: collectedToday,
-      overdueLoans: overdueLoans.length,
-      totalCustomers: db.customers.length,
-      inventoryStockValue,
-      outstandingBalance: db.loans.reduce((sum, loan) => sum + money(loan.balance), 0),
-      defaultedLoans: db.loans.filter((loan) => loan.status === "Defaulted").length,
-      monthlyProfit: Math.round(monthlyCollections * 0.18 + monthlyFees)
-    },
-    repaymentSeries,
-    loanTrend: [
-      { label: "Pending", count: db.loans.filter((loan) => loan.status === "Pending").length },
-      { label: "Active", count: db.loans.filter((loan) => loan.status === "Active").length },
-      { label: "Completed", count: db.loans.filter((loan) => loan.status === "Completed").length },
-      { label: "Defaulted", count: db.loans.filter((loan) => loan.status === "Defaulted").length }
-    ],
-    recentTransactions: db.payments
-      .slice()
-      .sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date))
-      .slice(0, 6)
-      .map(decoratedPayment),
-    duePayments: db.loans
-      .filter((loan) => loan.balance > 0)
-      .slice()
-      .sort((a, b) => new Date(a.due_date) - new Date(b.due_date))
-      .slice(0, 6)
-      .map(decoratedLoan),
-    lowStockAlerts: db.inventory.filter((item) => item.quantity <= 2)
-  };
 }
 
-async function serveStatic(request, response, pathname) {
-  const relativePath = publicFiles[pathname];
-  if (!relativePath) {
-    response.writeHead(404);
-    response.end("Not found");
-    return;
+async function authorizeTenantAdmin(req, res, action) {
+  if (isSuperAdmin(req)) {
+    if (req.method === "GET") return true;
+    if (!req.supportOverride) {
+      fail(res, 403, "Super Admin accounts are read-only. Start an audited support override to make changes.");
+      return false;
+    }
+    return true;
   }
+  if (req.authUser.role === "Admin") return true;
+  fail(res, 403, "Organization administrator permission required");
+  return false;
+}
 
-  const filePath = path.join(__dirname, relativePath);
-  let content;
+function selectedOrganization(req) {
+  if (isSuperAdmin(req)) {
+    return req.supportOverride && req.supportOverride.scope === "organization"
+      ? Number(req.supportOverride.organization_id)
+      : null;
+  }
+  return Number(req.authUser.organization_id);
+}
+
+function businessOrganization(req) {
+  return selectedOrganization(req);
+}
+
+function businessPermission(req, moduleName) {
+  if (isSuperAdmin(req) || req.authUser.role === "Admin") return true;
+  const permissions = effectiveSettings(req.authUser.organization).security.permissions || defaultPermissions;
+  const assigned = permissions[req.authUser.role];
+  return Array.isArray(assigned) ? assigned.includes(moduleName) : (defaultPermissions[req.authUser.role] || []).includes(moduleName);
+}
+
+function authorizeBusinessRead(req, res, moduleName) {
+  if (!requirePool(res)) return null;
+  if (!businessPermission(req, moduleName)) {
+    fail(res, 403, `Your role does not have access to ${moduleName}.`);
+    return null;
+  }
+  return businessOrganization(req);
+}
+
+function authorizeBusinessWrite(req, res, moduleName) {
+  if (!requirePool(res)) return null;
+  if (isSuperAdmin(req)) {
+    if (!req.supportOverride || req.supportOverride.scope !== "organization") {
+      fail(res, 403, "Super Admin accounts are read-only. Start an audited organization support override to make changes.");
+      return null;
+    }
+    return Number(req.supportOverride.organization_id);
+  }
+  if (!businessPermission(req, moduleName)) {
+    fail(res, 403, `Your role does not have permission to change ${moduleName}.`);
+    return null;
+  }
+  const organizationId = Number(req.authUser.organization_id);
+  return Number.isSafeInteger(organizationId) && organizationId > 0 ? organizationId : null;
+}
+
+function positiveId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function finiteAmount(value, { min = 0, max = 1000000000000 } = {}) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < min || amount > max) return null;
+  return Math.round(amount * 100) / 100;
+}
+
+function validDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) &&
+    new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+}
+
+async function businessTransaction(req, organizationId, action, callback) {
+  return auditSupportWriteIfNeeded(req, action, async (client) => {
+    await setContext(client, {
+      organizationId,
+      userId: req.authUser.id,
+      globalReadOnly: isSuperAdmin(req),
+      supportOverride: isSuperAdmin(req)
+    });
+    return callback(client);
+  });
+}
+
+async function resolveBusinessBranch(client, req, organizationId, requestedBranchId) {
+  const branchId = positiveId(requestedBranchId || req.authUser.branch_id);
+  if (!branchId) return null;
+  if (!isSuperAdmin(req) && req.authUser.role !== "Admin" &&
+    branchId !== Number(req.authUser.branch_id)) return null;
+  const { rows } = await client.query(
+    "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 AND status = 'Active' LIMIT 1",
+    [branchId, organizationId]
+  );
+  return rows[0] || null;
+}
+
+async function auditSupportWrite(req, action, callback) {
+  const override = req.supportOverride;
+  return transaction(async (client) => {
+    const orgId = override.scope === "organization" ? override.organization_id : null;
+    await setContext(client, {
+      organizationId: orgId,
+      globalReadOnly: true,
+      platformOverride: override.scope === "platform",
+      supportOverride: override.scope === "organization"
+    });
+    const result = callback ? await callback(client) : null;
+    await auditOverride(client, req, action, override);
+    return result;
+  });
+}
+
+app.get("/api/health", (req, res) => {
+  reply(res, 200, { ok: true, service: "DRAMAN LMS API", database_configured: Boolean(pool), timestamp: new Date().toISOString() });
+});
+
+app.post("/api/login", async (req, res) => {
+  if (!requirePool(res)) return;
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
   try {
-    content = await fs.readFile(filePath);
-  } catch (error) {
-    console.error(`Failed to serve ${relativePath}:`, error);
-    response.writeHead(500);
-    response.end("Internal server error");
-    return;
-  }
-
-  const extension = path.extname(filePath).toLowerCase();
-  response.writeHead(200, {
-    "Content-Type": mimeTypes[extension] || "application/octet-stream",
-    "Cache-Control": "no-store"
-  });
-  response.end(content);
-}
-
-async function handleApi(request, response, pathname) {
-  if (request.method === "OPTIONS") {
-    sendJson(response, 204, {});
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/health") {
-    sendJson(response, 200, { ok: true, service: "DRAMAN LMS API", timestamp: todayIso() });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/password/forgot") {
-    const body = await parseBody(request);
-    const email = String(body.email || "").trim().toLowerCase();
-    const user = db.users.find((item) => item.email.toLowerCase() === email && item.status === "Active");
-    if (user) {
-      const token = crypto.randomBytes(32).toString("base64url");
-      const record = {
-        token_hash: resetTokenKey(token),
-        user_id: user.id,
-        expires_at: Date.now() + 60 * 60 * 1000,
-        outbox_file: ""
-      };
-      passwordResetTokens = passwordResetTokens.filter((item) => item.expires_at > Date.now());
-      passwordResetTokens.push(record);
-      try {
-        await sendPasswordResetInstructions(user, token, record);
-        await saveAuthStore();
-      } catch (error) {
-        passwordResetTokens = passwordResetTokens.filter((item) => item !== record);
-        await saveAuthStore();
-        console.error("Could not deliver password reset instructions:", error.message);
-        sendJson(response, 503, {
-          message: process.env.NODE_ENV === "production"
-            ? "Password reset email is temporarily unavailable. Contact your administrator."
-            : "Could not create password reset instructions. Check the private data folder permissions."
-        });
-        return;
-      }
+    const { rows } = await readQuery(
+      "SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1",
+      [email]
+    );
+    const user = rows[0];
+    if (!user || !await bcrypt.compare(password, user.password_hash)) {
+      return fail(res, 401, "The email or password is incorrect.", "INVALID_CREDENTIALS");
     }
-    sendJson(response, 200, { message: "If an active account uses that email, password reset instructions are available." });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/password/reset") {
-    const body = await parseBody(request);
-    const token = String(body.token || "");
-    const password = String(body.password || "");
-    const minimumPasswordLength = db.settings.security.minimum_password_length;
-    if (password.length < minimumPasswordLength || password.length > 128) {
-      sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
-      return;
-    }
-    const tokenHash = resetTokenKey(token);
-    const resetRecord = passwordResetTokens.find((item) => item.token_hash === tokenHash);
-    if (!resetRecord || resetRecord.expires_at <= Date.now()) {
-      passwordResetTokens = passwordResetTokens.filter((item) => item.expires_at > Date.now());
-      await saveAuthStore();
-      sendJson(response, 400, { message: "That password reset link is invalid or expired. Request a new one." });
-      return;
-    }
-    const user = db.users.find((item) => item.id === resetRecord.user_id && item.status === "Active");
-    if (!user) {
-      passwordResetTokens = passwordResetTokens.filter((item) => item !== resetRecord);
-      await saveAuthStore();
-      sendJson(response, 400, { message: "That password reset link is invalid or expired. Request a new one." });
-      return;
-    }
-    user.password_hash = await hashPassword(password);
-    expireUserSessions(user);
-    passwordResetTokens = passwordResetTokens.filter((item) => item.user_id !== user.id);
-    if (resetRecord.outbox_file) {
-      try {
-        await fs.unlink(path.join(passwordResetOutboxPath, resetRecord.outbox_file));
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-    }
-    await saveAuthStore();
-    sendJson(response, 200, { message: "Password changed. Sign in with your new password." });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/login") {
-    const body = await parseBody(request);
-    const email = String(body.email || "").trim().toLowerCase();
-    const password = String(body.password || "");
-    const user = db.users.find((item) => item.email.toLowerCase() === email);
-    const passwordValid = user ? await verifyPassword(password, user.password_hash) : false;
-    if (!user || !passwordValid) {
-      sendJson(response, 401, { message: "The email or password is incorrect." });
-      return;
+    if (user.status === "Pending") {
+      return fail(res, 403, "Your account is awaiting administrator approval. Use the same email and password after approval.", "ACCOUNT_PENDING");
     }
     if (user.status !== "Active") {
-      sendJson(response, 403, { message: "Your account is awaiting administrator approval." });
-      return;
+      return fail(res, 403, "Your account is suspended or inactive. Contact your organization administrator.", "ACCOUNT_INACTIVE");
     }
-    const expiresAt = Date.now() + db.settings.security.session_timeout_hours * 60 * 60 * 1000;
-    if (user.role === "Super Admin") {
-      try {
-        await fs.unlink(bootstrapCredentialsPath);
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-    }
-    response.sessionCookie = sessionCookie(signSession(user, expiresAt), expiresAt);
-    if (db.settings.security.audit_logging_enabled) {
-      db.activity_logs.unshift({
-        id: nextId(db.activity_logs),
-        user_id: user.id,
-        action: `${user.full_name} logged in`,
-        created_at: todayIso()
-      });
-    }
-    sendJson(response, 200, {
-      expires_at: new Date(expiresAt).toISOString(),
-      user: publicUser(user)
-    });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/register") {
-    const body = await parseBody(request);
-    const fullName = String(body.full_name || "").trim();
-    const email = String(body.email || "").trim().toLowerCase();
-    const employeeId = String(body.employee_id || "").trim().toUpperCase();
-    const password = String(body.password || "");
-    const invitationCode = String(body.invitation_code || "").trim().toUpperCase();
-
-    if (fullName.length < 2 || fullName.length > 100 || !validEmail(email)) {
-      sendJson(response, 400, { message: "Enter a valid name and personal email address." });
-      return;
-    }
-    if (employeeId && (employeeId.length < 3 || employeeId.length > 32 || !/^[A-Z0-9-]+$/.test(employeeId))) {
-      sendJson(response, 400, { message: "Staff IDs must contain 3 to 32 letters, numbers, or hyphens." });
-      return;
-    }
-    const minimumPasswordLength = db.settings.security.minimum_password_length;
-    if (password.length < minimumPasswordLength || password.length > 128) {
-      sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
-      return;
-    }
-
-    let invitation = null;
-    if (invitationCode) {
-      const codeHash = crypto.createHash("sha256").update(invitationCode).digest();
-      invitation = db.invitations.find((item) => {
-        const expectedHash = Buffer.from(item.code_hash, "hex");
-        return !item.used_at && new Date(item.expires_at) > new Date() &&
-          expectedHash.length === codeHash.length && crypto.timingSafeEqual(expectedHash, codeHash);
-      });
-      if (!invitation) {
-        sendJson(response, 403, { message: "That invitation code is invalid, expired, or already used." });
-        return;
-      }
-    }
-    if (db.users.some((item) => item.email.toLowerCase() === email)) {
-      sendJson(response, 409, { message: "An account already uses that email address." });
-      return;
-    }
-    if (employeeId && db.settings.security.require_unique_staff_ids &&
-      db.users.some((item) => item.employee_id && item.employee_id.toUpperCase() === employeeId)) {
-      sendJson(response, 409, { message: "That staff ID is already registered." });
-      return;
-    }
-
-    const user = {
-      id: nextId(db.users),
-      full_name: fullName,
-      email,
-      employee_id: employeeId,
-      phone: "",
-      role: invitation ? invitation.role : "Cashier",
-      status: invitation ? "Active" : "Pending",
-      session_version: 0,
-      password_hash: await hashPassword(password),
-      created_at: todayIso()
-    };
-    db.users.push(user);
-    if (invitation) {
-      invitation.used_at = todayIso();
-      invitation.used_by = user.id;
-    }
-    await saveAuthStore();
-    if (db.settings.security.audit_logging_enabled) {
-      db.activity_logs.unshift({
-        id: nextId(db.activity_logs),
-        user_id: invitation ? invitation.created_by : user.id,
-        action: invitation
-          ? `${user.full_name} registered as ${user.role}`
-          : `${user.full_name} requested a team account`,
-        created_at: todayIso()
-      });
-    }
-    sendJson(response, 201, {
-      message: invitation
-        ? "Account created. Sign in with your personal email."
-        : "Account request submitted. An administrator must approve it before you can sign in.",
-      user: publicUser(user)
-    });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/logout") {
-    const user = sessionUser(request);
-    if (user) {
-      expireUserSessions(user);
-      await saveAuthStore();
-    }
-    response.sessionCookie = clearSessionCookie();
-    sendJson(response, 200, { message: "Signed out" });
-    return;
-  }
-
-  if (!sessionUser(request)) {
-    response.sessionCookie = clearSessionCookie();
-    sendJson(response, 401, { message: "Your session has expired. Please sign in again." });
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/session") {
-    sendJson(response, 200, {
-      user: publicUser(request.authUser),
-      expires_at: new Date(request.sessionExpiresAt).toISOString()
-    });
-    return;
-  }
-
-  if (request.method === "PUT" && pathname === "/api/account") {
-    const body = await parseBody(request);
-    const currentPassword = String(body.current_password || "");
-    const nextEmail = String(body.email || "").trim().toLowerCase();
-    const nextPassword = String(body.new_password || "");
-    if (!await verifyPassword(currentPassword, request.authUser.password_hash)) {
-      sendJson(response, 400, { message: "Current password is incorrect." });
-      return;
-    }
-    if (!validEmail(nextEmail)) {
-      sendJson(response, 400, { message: "Enter a valid email address." });
-      return;
-    }
-    if (db.users.some((user) => user.id !== request.authUser.id && user.email.toLowerCase() === nextEmail)) {
-      sendJson(response, 409, { message: "That email address is already associated with an account." });
-      return;
-    }
-    if (nextPassword) {
-      const minimumPasswordLength = db.settings.security.minimum_password_length;
-      if (nextPassword.length < minimumPasswordLength || nextPassword.length > 128) {
-        sendJson(response, 400, { message: `Choose a password with at least ${minimumPasswordLength} characters.` });
-        return;
-      }
-    }
-
-    request.authUser.email = nextEmail;
-    if (nextPassword) {
-      request.authUser.password_hash = await hashPassword(nextPassword);
-      expireUserSessions(request.authUser);
-    }
-    await saveAuthStore();
-    if (nextPassword) {
-      response.sessionCookie = sessionCookie(
-        signSession(request.authUser, request.sessionExpiresAt),
-        request.sessionExpiresAt
+    let organization = null;
+    if (user.organization_id != null) {
+      const result = await readQuery(
+        "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
+        [user.organization_id]
       );
-    }
-    sendJson(response, 200, { user: publicUser(request.authUser) });
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/settings") {
-    sendJson(response, 200, db.settings);
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/notifications") {
-    sendJson(response, 200, { notifications: buildNotifications(request.authUser) });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/system-backup") {
-    if (!requireSuperAdmin(request, response)) return;
-    const createdAt = todayIso();
-    const fileName = `draman-backup-${createdAt.replace(/[:.]/g, "-")}.json`;
-    sendJson(response, 200, {
-      format_version: 1,
-      application: "DRAMAN Loan Services Management System",
-      created_at: createdAt,
-      file_name: fileName,
-      data: {
-        ...JSON.parse(JSON.stringify(db)),
-        users: db.users.map(publicUser),
-        invitations: db.invitations.map(publicInvitation)
+      organization = result.rows[0] || null;
+      if (!organization || organization.status !== "Active") {
+        return fail(res, 403, "Your organization is inactive. Contact platform support.", "ORGANIZATION_INACTIVE");
       }
-    });
-    return;
-  }
-
-  const settingsMatch = pathname.match(/^\/api\/settings\/(business|loan|security)$/);
-  if (request.method === "PUT" && settingsMatch) {
-    if (!requireSuperAdmin(request, response)) return;
-    const section = settingsMatch[1];
-    const body = await parseBody(request);
-    const current = db.settings[section];
-    const numericRanges = {
-      default_interest_rate: [0, 100],
-      processing_fee: [0, 100000000],
-      grace_period_days: [0, 365],
-      late_penalty_rate: [0, 100],
-      approval_threshold: [0, 1000000000],
-      session_timeout_hours: [1, 168],
-      minimum_password_length: [10, 128]
-    };
-    const booleanFields = ["sms_enabled", "require_unique_staff_ids", "audit_logging_enabled"];
-    for (const [key, value] of Object.entries(body)) {
-      if (!Object.prototype.hasOwnProperty.call(current, key)) {
-        sendJson(response, 400, { message: `Unknown ${section} setting: ${key}` });
-        return;
-      }
-      if (numericRanges[key]) {
-        const [minimum, maximum] = numericRanges[key];
-        if (!Number.isFinite(Number(value)) || Number(value) < minimum || Number(value) > maximum) {
-          sendJson(response, 400, { message: `${key} must be between ${minimum} and ${maximum}.` });
-          return;
-        }
-        body[key] = Number(value);
-      } else if (booleanFields.includes(key)) {
-        if (typeof value !== "boolean") {
-          sendJson(response, 400, { message: `${key} must be true or false.` });
-          return;
-        }
-      } else if (key === "logo_data") {
-        if (typeof value !== "string" || value.length > 1500000 ||
-          (value !== "" && !/^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(value))) {
-          sendJson(response, 400, { message: "Choose a supported image no larger than 1 MB for the business logo." });
-          return;
-        }
-      } else if (key === "backup_schedule") {
-        if (!["Daily", "Weekly", "Monthly", "Disabled"].includes(value)) {
-          sendJson(response, 400, { message: "Choose a valid backup schedule." });
-          return;
-        }
-      } else if (key === "permissions") {
-        const validModules = ["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"];
-        const validRoles = ["Loan Officer", "Cashier", "Inventory Manager"];
-        if (!value || typeof value !== "object" || Array.isArray(value) ||
-          Object.keys(value).length !== validRoles.length ||
-          validRoles.some((role) => !Array.isArray(value[role]) ||
-            value[role].some((moduleName) => !validModules.includes(moduleName)))) {
-          sendJson(response, 400, { message: "Choose valid menu permissions for each staff role." });
-          return;
-        }
-      } else if (typeof value !== "string" || value.length > 500) {
-        sendJson(response, 400, { message: `${key} must be a text value of 500 characters or fewer.` });
-        return;
+      const branchResult = await readQuery(
+        "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 LIMIT 1",
+        [user.branch_id, user.organization_id]
+      );
+      if (!branchResult.rows[0] || branchResult.rows[0].status !== "Active") {
+        return fail(res, 403, "Your account is active but no branch is assigned. Contact your organization administrator.", "BRANCH_UNASSIGNED");
       }
     }
-    db.settings[section] = { ...current, ...body };
-    sendJson(response, 200, db.settings);
-    return;
+    const timeoutHours = Number(effectiveSettings(organization).security.session_timeout_hours) || 24;
+    const expiresAt = Date.now() + timeoutHours * 60 * 60 * 1000;
+    setSessionCookie(res, user, expiresAt);
+    reply(res, 200, { expires_at: new Date(expiresAt).toISOString(), user: publicUser(user) });
+  } catch (error) {
+    console.error("PostgreSQL login failed:", error.message);
+    fail(res, 503, "Could not authenticate using PostgreSQL.");
   }
+});
 
-  if (request.method === "GET" && pathname === "/api/team") {
-    if (!requireSuperAdmin(request, response)) return;
-    sendJson(response, 200, db.users.map(publicUser));
-    return;
+app.post("/api/register", async (req, res) => {
+  if (!requirePool(res)) return;
+  const fullName = String(req.body.full_name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const employeeId = String(req.body.employee_id || "").trim().toUpperCase();
+  const password = String(req.body.password || "");
+  const invitationCode = String(req.body.invitation_code || "").trim().toUpperCase();
+  if (fullName.length < 2 || fullName.length > 160 || !validEmail(email)) {
+    return fail(res, 400, "Enter a valid name and personal email address.");
   }
-
-  const teamApprovalMatch = pathname.match(/^\/api\/team\/(\d+)\/approve$/);
-  if (request.method === "POST" && teamApprovalMatch) {
-    if (!requireSuperAdmin(request, response)) return;
-    const body = await parseBody(request);
-    const role = String(body.role || "");
-    if (!allowedRoles.includes(role) || role === "Super Admin") {
-      sendJson(response, 400, { message: "Choose an approved staff role." });
-      return;
-    }
-    const member = db.users.find((user) => user.id === Number(teamApprovalMatch[1]));
-    if (!member) {
-      sendJson(response, 404, { message: "Account request not found." });
-      return;
-    }
-    if (member.status !== "Pending") {
-      sendJson(response, 409, { message: "Only pending account requests can be approved." });
-      return;
-    }
-    member.role = role;
-    member.status = "Active";
-    await saveAuthStore();
-    db.activity_logs.unshift({
-      id: nextId(db.activity_logs),
-      user_id: request.authUser.id,
-      action: `${member.full_name} approved as ${role}`,
-      created_at: todayIso()
+  if (employeeId && (employeeId.length < 3 || employeeId.length > 32 || !/^[A-Z0-9-]+$/.test(employeeId))) {
+    return fail(res, 400, "Staff IDs must contain 3 to 32 letters, numbers, or hyphens.");
+  }
+  if (!invitationCode) return fail(res, 403, "A valid organization invitation is required to create a staff account.", "INVITATION_REQUIRED");
+  try {
+    const registeredUser = await transaction(async (client) => {
+      await setContext(client);
+      const { rows: invitations } = await client.query(
+        `SELECT * FROM invitation_codes
+         WHERE code_hash = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > NOW()
+         FOR UPDATE`,
+        [hashInvitation(invitationCode)]
+      );
+      const invitation = invitations[0];
+      if (!invitation || !allowedRoles.includes(invitation.role)) {
+        const error = new Error("INVITATION_INVALID");
+        error.code = "INVITATION_INVALID";
+        throw error;
+      }
+      await setContext(client, { organizationId: invitation.organization_id, globalReadOnly: true });
+      const { rows: organizations } = await client.query(
+        "SELECT id, name, status, settings FROM organizations WHERE id = $1 LIMIT 1",
+        [invitation.organization_id]
+      );
+      const organization = organizations[0];
+      const { rows: branches } = await client.query(
+        "SELECT id, organization_id, name, status FROM branches WHERE id = $1 AND organization_id = $2 LIMIT 1",
+        [invitation.branch_id, invitation.organization_id]
+      );
+      const branch = branches[0];
+      if (!organization || organization.status !== "Active") {
+        const error = new Error("ORGANIZATION_INACTIVE");
+        error.code = "ORGANIZATION_INACTIVE";
+        throw error;
+      }
+      if (!branch || branch.status !== "Active") {
+        const error = new Error("BRANCH_UNASSIGNED");
+        error.code = "BRANCH_UNASSIGNED";
+        throw error;
+      }
+      const settings = effectiveSettings(organization).security;
+      if (password.length < settings.minimum_password_length || password.length > 128) {
+        const error = new Error("PASSWORD_POLICY");
+        error.message = `Choose a password with at least ${settings.minimum_password_length} characters.`;
+        error.status = 400;
+        throw error;
+      }
+      const { rows: existingUsers } = await client.query(
+        "SELECT id, email, employee_id FROM users WHERE lower(email) = lower($1) OR ($2 <> '' AND employee_id = $2 AND organization_id = $3)",
+        [email, employeeId, organization.id]
+      );
+      if (existingUsers.some((user) => user.email.toLowerCase() === email)) {
+        const error = new Error("EMAIL_EXISTS");
+        error.status = 409;
+        throw error;
+      }
+      if (employeeId && settings.require_unique_staff_ids &&
+        existingUsers.some((user) => user.employee_id && user.employee_id.toUpperCase() === employeeId)) {
+        const error = new Error("EMPLOYEE_EXISTS");
+        error.status = 409;
+        throw error;
+      }
+      await setContext(client, { organizationId: organization.id, globalReadOnly: false });
+      const passwordHash = await bcrypt.hash(password, 12);
+      const { rows: created } = await client.query(
+        `INSERT INTO users
+          (organization_id, branch_id, full_name, email, phone, employee_id, password_hash, role, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [
+          organization.id, branch.id, fullName, email, "", employeeId || null, passwordHash,
+          invitation.role, invitation.activation_status === "Active" ? "Active" : "Pending"
+        ]
+      );
+      const user = created[0];
+      await client.query(
+        "UPDATE invitation_codes SET used_at = NOW(), used_by = $1 WHERE id = $2 AND used_at IS NULL AND revoked_at IS NULL",
+        [user.id, invitation.id]
+      );
+      return user;
     });
-    sendJson(response, 200, { user: publicUser(member) });
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/invitations") {
-    if (!requireSuperAdmin(request, response)) return;
-    const pending = db.invitations.filter((item) => !item.used_at && new Date(item.expires_at) > new Date());
-    sendJson(response, 200, pending.map(publicInvitation));
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/invitations") {
-    if (!requireSuperAdmin(request, response)) return;
-    const body = await parseBody(request);
-    if (!allowedRoles.includes(body.role)) {
-      sendJson(response, 400, { message: "Choose a valid team role." });
-      return;
-    }
-    const count = body.count === undefined ? 1 : Number(body.count);
-    if (!Number.isInteger(count) || count < 1 || count > 50) {
-      sendJson(response, 400, { message: "Create between 1 and 50 invitation codes at a time." });
-      return;
-    }
-    const createdInvitations = Array.from({ length: count }, () => {
-      const code = `DRM-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
-      const invitation = {
-        id: nextId(db.invitations),
-        role: body.role,
-        code_hash: crypto.createHash("sha256").update(code).digest("hex"),
-        created_by: request.authUser.id,
-        created_at: todayIso(),
-        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-        used_at: null,
-        used_by: null
-      };
-      db.invitations.unshift(invitation);
-      return { invitation: publicInvitation(invitation), code };
+    reply(res, 201, {
+      message: registeredUser.status === "Active"
+        ? "Your account is active. Sign in with the email and password you just created."
+        : "Your account request is pending approval. Your email and password are saved; use them after approval.",
+      user: publicUser(registeredUser)
     });
-    await saveAuthStore();
-    sendJson(response, 201, {
-      invitations: createdInvitations,
-      invitation: createdInvitations[0].invitation,
-      code: createdInvitations[0].code
-    });
-    return;
+  } catch (error) {
+    if (error.code === "INVITATION_INVALID") return fail(res, 403, "That invitation code is invalid, expired, revoked, or already used.", "INVITATION_INVALID");
+    if (error.code === "ORGANIZATION_INACTIVE") return fail(res, 403, "This invitation belongs to an inactive organization.", error.code);
+    if (error.code === "BRANCH_UNASSIGNED") return fail(res, 403, "This invitation has no active branch assignment. Contact the organization administrator.", error.code);
+    if (error.status) return fail(res, error.status, error.message);
+    if (error.code === "23505") return fail(res, 409, "That email address or staff ID is already registered.");
+    console.error("PostgreSQL registration failed:", error.message);
+    fail(res, 503, "Could not create the account using PostgreSQL.");
   }
+});
 
-  if (request.method === "GET" && pathname === "/api/summary") {
-    sendJson(response, 200, buildSummary());
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/customers") {
-    if (!requireModule(request, response, "customers")) return;
-    sendJson(response, 200, db.customers);
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/customers") {
-    if (!requireModule(request, response, "customers")) return;
-    const body = await parseBody(request);
-    const customer = {
-      id: nextId(db.customers),
-      customer_code: nextCode("CUS", db.customers, "customer_code"),
-      full_name: body.full_name || "Unnamed Customer",
-      national_id: body.national_id || "",
-      phone: body.phone || "",
-      alt_phone: body.alt_phone || "",
-      email: body.email || "",
-      gender: body.gender || "",
-      dob: body.dob || "",
-      occupation: body.occupation || "",
-      monthly_income: money(body.monthly_income),
-      county: body.county || "",
-      estate: body.estate || "",
-      address: body.address || "",
-      photo: body.photo || "",
-      id_front: body.id_front || "",
-      id_back: body.id_back || "",
-      signature: body.signature || "",
-      blacklist_status: Boolean(body.blacklist_status),
-      created_at: todayIso()
-    };
-    db.customers.unshift(customer);
-
-    if (body.guarantor_name || body.guarantor_phone) {
-      db.guarantors.unshift({
-        id: nextId(db.guarantors),
-        customer_id: customer.id,
-        full_name: body.guarantor_name || "",
-        national_id: body.guarantor_id || "",
-        phone: body.guarantor_phone || "",
-        relationship: body.relationship || "",
-        address: body.guarantor_address || ""
+app.post("/api/logout", authenticate, async (req, res) => {
+  try {
+    await transaction(async (client) => {
+      await setContext(client, {
+        organizationId: req.authUser.organization_id,
+        userId: req.authUser.id,
+        globalReadOnly: false
       });
+      await client.query("UPDATE users SET session_version = session_version + 1 WHERE id = $1", [req.authUser.id]);
+    });
+    clearSessionCookie(res);
+    reply(res, 200, { message: "Signed out" });
+  } catch (error) {
+    console.error("Could not invalidate user sessions:", error.message);
+    fail(res, 503, "Could not sign out using PostgreSQL.");
+  }
+});
+
+app.get("/api/session", authenticate, (req, res) => {
+  reply(res, 200, {
+    user: publicUser(req.authUser),
+    expires_at: new Date(req.sessionExpiresAt).toISOString(),
+    support_override: req.supportOverride
+  });
+});
+
+app.post("/api/support-override", authenticate, async (req, res) => {
+  if (!isSuperAdmin(req)) return fail(res, 403, "Only a Super Admin can start a support override.");
+  const body = req.body || {};
+  const current = req.supportOverride;
+  if (body.action === "stop") {
+    if (!current) return fail(res, 409, "No support override is active.");
+    try {
+      await transaction((client) => auditOverride(client, req, "support override ended", current));
+      setSessionCookie(res, req.authUser, req.sessionExpiresAt);
+      return reply(res, 200, { support_override: null, expires_at: new Date(req.sessionExpiresAt).toISOString() });
+    } catch (error) {
+      console.error("Could not record support override audit:", error.message);
+      return fail(res, 503, "Could not record the support override audit in PostgreSQL.");
     }
-
-    sendJson(response, 201, customer);
-    return;
   }
-
-  if (request.method === "DELETE" && pathname === "/api/customers") {
-    if (!requireSuperAdmin(request, response)) return;
-    clearCustomerData();
-    sendJson(response, 200, { message: "All customer records cleared" });
-    return;
-  }
-
-  const customerDeleteMatch = pathname.match(/^\/api\/customers\/(\d+)$/);
-  if (request.method === "DELETE" && customerDeleteMatch) {
-    if (!requireSuperAdmin(request, response)) return;
-    const customerId = Number(customerDeleteMatch[1]);
-    const existingCustomer = db.customers.find((customer) => customer.id === customerId);
-    if (!existingCustomer) {
-      sendJson(response, 404, { message: "Customer not found" });
-      return;
+  if (body.action !== "start" || current) return fail(res, 409, "End the current override before starting another.");
+  const reason = String(body.reason || "").trim();
+  const scope = body.scope === "platform" ? "platform" : "organization";
+  if (reason.length < 15 || reason.length > 500) return fail(res, 400, "Provide a support reason between 15 and 500 characters.");
+  let organization = null;
+  if (scope === "organization") {
+    try {
+      const result = await readQuery("SELECT id, name, status FROM organizations WHERE id = $1 LIMIT 1", [Number(body.organization_id)]);
+      organization = result.rows[0];
+    } catch (error) {
+      console.error("Could not read support organization:", error.message);
+      return fail(res, 503, "Could not verify the organization using PostgreSQL.");
     }
-    removeCustomerLinks(customerId);
-    sendJson(response, 200, { message: `${existingCustomer.full_name} deleted` });
-    return;
+    if (!organization || organization.status !== "Active") return fail(res, 404, "Choose an active organization for the support override.");
   }
-
-  if (request.method === "GET" && pathname === "/api/guarantors") {
-    if (!requireModule(request, response, "customers")) return;
-    sendJson(response, 200, db.guarantors);
-    return;
+  const override = {
+    scope,
+    reason,
+    started_at: Date.now(),
+    organization_id: organization ? Number(organization.id) : null,
+    organization_name: organization ? organization.name : ""
+  };
+  const action = scope === "platform" ? "platform support override started" : `support override started for ${organization.name}`;
+  try {
+    await transaction((client) => auditOverride(client, req, action, override));
+    setSessionCookie(res, req.authUser, req.sessionExpiresAt, override);
+    return reply(res, 200, { support_override: override, expires_at: new Date(req.sessionExpiresAt).toISOString() });
+  } catch (error) {
+    console.error("Could not record support override audit:", error.message);
+    return fail(res, 503, "Could not record the support override audit in PostgreSQL.");
   }
+});
 
-  if (request.method === "GET" && pathname === "/api/loans") {
-    if (!requireModule(request, response, "loans")) return;
-    sendJson(response, 200, db.loans.map(decoratedLoan));
-    return;
+app.get("/api/organizations", authenticate, async (req, res) => {
+  if (!requirePool(res)) return;
+  try {
+    const { rows } = await readQuery(
+      "SELECT id, name, status, created_at FROM organizations ORDER BY id",
+      [],
+      { globalReadOnly: true }
+    );
+    const orgId = selectedOrganization(req);
+    reply(res, 200, orgId == null ? rows : rows.filter((row) => Number(row.id) === orgId));
+  } catch (error) {
+    console.error("Could not list organizations:", error.message);
+    fail(res, 503, "Could not list organizations using PostgreSQL.");
   }
+});
 
-  if (request.method === "POST" && pathname === "/api/loans") {
-    if (!requireModule(request, response, "loans")) return;
-    const body = await parseBody(request);
-    const principal = money(body.principal_amount);
-    const interestRate = money(body.interest_rate);
-    const processingFee = money(body.processing_fee);
-    const totalInterest = Math.round(principal * (interestRate / 100));
-    const totalPayable = principal + totalInterest + processingFee;
-    const loanRequiresApproval = principal >= db.settings.loan.approval_threshold;
-    const loan = {
-      id: nextId(db.loans),
-      loan_code: nextCode("LOAN", db.loans, "loan_code"),
-      customer_id: Number(body.customer_id),
-      principal_amount: principal,
-      interest_rate: interestRate,
-      processing_fee: processingFee,
-      total_payable: totalPayable,
-      total_paid: 0,
-      balance: totalPayable,
-      repayment_frequency: body.repayment_frequency || "Monthly",
-      start_date: body.start_date || dateOnly(new Date()),
-      due_date: body.due_date || dateOnly(new Date()),
-      status: loanRequiresApproval ? "Pending" : "Approved",
-      assigned_officer: body.assigned_officer || "Unassigned",
-      approved_by: loanRequiresApproval ? null : request.authUser.id,
-      created_at: todayIso()
-    };
-    db.loans.unshift(loan);
-    sendJson(response, 201, decoratedLoan(loan));
-    return;
+app.post("/api/organizations", authenticate, async (req, res) => {
+  if (!isSuperAdmin(req) || !req.supportOverride || req.supportOverride.scope !== "platform") {
+    return fail(res, 403, "Organization provisioning requires a platform support override.");
   }
-
-  const loanApprovalMatch = pathname.match(/^\/api\/loans\/(\d+)\/approve$/);
-  if (request.method === "POST" && loanApprovalMatch) {
-    if (!requireSuperAdmin(request, response)) return;
-    const loan = db.loans.find((item) => item.id === Number(loanApprovalMatch[1]));
-    if (!loan) {
-      sendJson(response, 404, { message: "Loan not found" });
-      return;
-    }
-    if (loan.status !== "Pending") {
-      sendJson(response, 409, { message: "Only pending loans can be approved." });
-      return;
-    }
-    loan.status = "Approved";
-    loan.approved_by = request.authUser.id;
-    if (db.settings.security.audit_logging_enabled) {
-      db.activity_logs.unshift({
-        id: nextId(db.activity_logs),
-        user_id: request.authUser.id,
-        action: `${request.authUser.full_name} approved ${loan.loan_code}`,
-        created_at: todayIso()
-      });
-    }
-    sendJson(response, 200, decoratedLoan(loan));
-    return;
+  const name = String(req.body.name || "").trim();
+  if (name.length < 2 || name.length > 120) return fail(res, 400, "Organization name must contain 2 to 120 characters.");
+  const code = `DRM-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+  const settings = JSON.stringify(defaultSettings);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  try {
+    const created = await auditSupportWrite(req, "create organization", async (client) => {
+      await client.query("SELECT set_config('app.platform_override', $1, true)", ["true"]);
+      await client.query("SELECT set_config('app.global_read_only', $1, true)", ["true"]);
+      const orgResult = await client.query(
+        "INSERT INTO organizations (name, status, settings) VALUES ($1, 'Active', $2::jsonb) RETURNING id, name, status, created_at",
+        [name, settings]
+      );
+      const organization = orgResult.rows[0];
+      await client.query(
+        "INSERT INTO branches (organization_id, name, status) VALUES ($1, $2, 'Active')",
+        [organization.id, "Main Branch"]
+      );
+      const branchResult = await client.query(
+        "SELECT id, organization_id, name, status, created_at FROM branches WHERE organization_id = $1 ORDER BY id DESC LIMIT 1",
+        [organization.id]
+      );
+      await client.query(
+        `INSERT INTO invitation_codes
+          (organization_id, branch_id, role, activation_status, code_hash, created_by, expires_at)
+         VALUES ($1, $2, 'Admin', 'Active', $3, $4, $5)`,
+        [organization.id, branchResult.rows[0].id, hashInvitation(code), req.authUser.id, expiresAt]
+      );
+      return { organization, branch: branchResult.rows[0] };
+    });
+    reply(res, 201, {
+      ...created,
+      admin_invitation_code: code,
+      invitation_expires_at: expiresAt.toISOString()
+    });
+  } catch (error) {
+    console.error("Could not create organization:", error.message);
+    fail(res, 503, "Could not create the organization and audit record using PostgreSQL.");
   }
+});
 
-  if (request.method === "GET" && pathname === "/api/payments") {
-    if (!requireModule(request, response, "payments")) return;
-    sendJson(response, 200, db.payments.map(decoratedPayment));
-    return;
+app.get("/api/branches", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res)) return;
+  const organizationId = selectedOrganization(req);
+  try {
+    const { rows } = organizationId == null
+      ? await readQuery("SELECT id, organization_id, name, status, created_at FROM branches ORDER BY id")
+      : await readQuery("SELECT id, organization_id, name, status, created_at FROM branches WHERE organization_id = $1 ORDER BY id", [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list branches:", error.message);
+    fail(res, 503, "Could not list branches using PostgreSQL.");
   }
+});
 
-  if (request.method === "POST" && pathname === "/api/payments") {
-    if (!requireModule(request, response, "payments")) return;
-    const body = await parseBody(request);
-    const loan = db.loans.find((item) => item.id === Number(body.loan_id));
-    if (!loan) {
-      sendJson(response, 404, { message: "Loan not found" });
-      return;
-    }
-    if (loan.status === "Pending") {
-      sendJson(response, 409, { message: "This loan must be approved before accepting payment." });
-      return;
-    }
-    const amount = money(body.amount_paid);
-    const payment = {
-      id: nextId(db.payments),
-      payment_code: nextCode("PAY", db.payments, "payment_code"),
-      loan_id: loan.id,
-      customer_id: loan.customer_id,
-      amount_paid: amount,
-      payment_method: body.payment_method || "Cash",
-      transaction_code: body.transaction_code || "",
-      received_by: Number(body.received_by || 3),
-      notes: body.notes || "",
-      payment_date: todayIso()
-    };
-
-    loan.total_paid = money(loan.total_paid) + amount;
-    loan.balance = Math.max(0, money(loan.balance) - amount);
-    if (loan.balance === 0) {
-      loan.status = "Completed";
-    } else if (loan.status === "Pending" || loan.status === "Approved") {
-      loan.status = "Active";
-    }
-
-    db.payments.unshift(payment);
-    sendJson(response, 201, decoratedPayment(payment));
-    return;
+app.post("/api/branches", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "settings");
+  if (!organizationId) {
+    return fail(res, 403, "Branches can only be created within an organization.");
   }
-
-  if (request.method === "GET" && pathname === "/api/inventory") {
-    if (!requireModule(request, response, "inventory")) return;
-    sendJson(response, 200, db.inventory);
-    return;
+  if (!["Admin", "Super Admin"].includes(req.authUser.role)) {
+    return fail(res, 403, "Administrator permission required to create branches.");
   }
-
-  if (request.method === "POST" && pathname === "/api/inventory") {
-    if (!requireModule(request, response, "inventory")) return;
-    const body = await parseBody(request);
-    const product = {
-      id: nextId(db.inventory),
-      product_name: body.product_name || "Unnamed Product",
-      category: body.category || "Household items",
-      quantity: Number.parseInt(body.quantity || 0, 10),
-      buying_price: money(body.buying_price),
-      selling_price: money(body.selling_price),
-      description: body.description || "",
-      condition: body.condition || "",
-      serial_number: body.serial_number || "",
-      image: body.image || "",
-      created_at: todayIso()
-    };
-    db.inventory.unshift(product);
-    sendJson(response, 201, product);
-    return;
+  const name = String(req.body.name || "").trim();
+  if (name.length < 2 || name.length > 120) return fail(res, 400, "Branch name must contain 2 to 120 characters.");
+  try {
+    const branch = await businessTransaction(req, organizationId, "create branch", async (client) => {
+      const { rows } = await client.query(
+        "INSERT INTO branches (organization_id, name, status) VALUES ($1, $2, 'Active') RETURNING id, organization_id, name, status, created_at",
+        [organizationId, name]
+      );
+      return rows[0];
+    });
+    reply(res, 201, branch);
+  } catch (error) {
+    if (error.code === "23505") return fail(res, 409, "That branch name already exists in this organization.");
+    console.error("Could not create branch:", error.message);
+    fail(res, 503, "Could not create the branch using PostgreSQL.");
   }
+});
 
-  if (request.method === "DELETE" && pathname === "/api/inventory") {
-    if (!requireSuperAdmin(request, response)) return;
-    db.inventory = [];
-    db.sales = [];
-    sendJson(response, 200, { message: "All product records cleared" });
-    return;
-  }
-
-  const inventoryDeleteMatch = pathname.match(/^\/api\/inventory\/(\d+)$/);
-  if (request.method === "DELETE" && inventoryDeleteMatch) {
-    if (!requireModule(request, response, "inventory")) return;
-    const productId = Number(inventoryDeleteMatch[1]);
-    const existingProduct = db.inventory.find((product) => product.id === productId);
-    if (!existingProduct) {
-      sendJson(response, 404, { message: "Product not found" });
-      return;
-    }
-    db.inventory = db.inventory.filter((product) => product.id !== productId);
-    db.sales = db.sales.filter((sale) => sale.inventory_id !== productId);
-    sendJson(response, 200, { message: `${existingProduct.product_name} deleted` });
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/sales") {
-    sendJson(response, 200, db.sales);
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/agreements") {
-    if (!requireModule(request, response, "agreements")) return;
-    sendJson(response, 200, db.agreements);
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/activity-logs") {
-    sendJson(response, 200, db.activity_logs);
-    return;
-  }
-
-  sendJson(response, 404, { message: "API route not found" });
+async function auditSupportWriteIfNeeded(req, action, callback) {
+  if (isSuperAdmin(req)) return auditSupportWrite(req, action, callback);
+  return transaction(async (client) => {
+    await setContext(client, { organizationId: req.authUser.organization_id, globalReadOnly: true });
+    return callback(client);
+  });
 }
 
-const initialization = loadPrivateData()
-  .then(async () => {
-    await saveBusinessData();
-    return null;
-  })
-  .catch((error) => {
-    console.error("Could not initialize private application data:", error);
-    return error;
-  });
-
-const app = async (request, response) => {
-  try {
-    const initializationError = await initialization;
-    if (initializationError) {
-      sendJson(response, 500, { message: "Could not initialize private application data." });
-      return;
-    }
-    const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    if (url.pathname.startsWith("/api/")) {
-      response.persistData = ["POST", "PUT", "PATCH", "DELETE"].includes(request.method);
-      await handleApi(request, response, url.pathname);
-      return;
-    }
-    await serveStatic(request, response, url.pathname);
-  } catch (error) {
-    console.error(error);
-    sendJson(response, 500, { message: "Internal server error" });
+app.put("/api/account", authenticate, async (req, res) => {
+  const currentPassword = String(req.body.current_password || "");
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const nextPassword = String(req.body.new_password || "");
+  if (!await bcrypt.compare(currentPassword, req.authUser.password_hash)) return fail(res, 400, "Current password is incorrect.");
+  if (!validEmail(email)) return fail(res, 400, "Enter a valid email address.");
+  if (nextPassword) {
+    const minLength = effectiveSettings(req.authUser.organization).security.minimum_password_length;
+    if (nextPassword.length < minLength || nextPassword.length > 128) return fail(res, 400, `Choose a password with at least ${minLength} characters.`);
   }
-};
-
-if (!process.env.VERCEL) {
-  initialization.then((error) => {
-    if (error) {
-      process.exitCode = 1;
-      return;
-    }
-    http.createServer(app).listen(PORT, () => {
-      console.log(`DRAMAN Loan Services app running at http://localhost:${PORT}`);
+  try {
+    const passwordHash = nextPassword ? await bcrypt.hash(nextPassword, 12) : req.authUser.password_hash;
+    const { rows } = await transaction(async (client) => {
+      await setContext(client, { organizationId: req.authUser.organization_id, userId: req.authUser.id, globalReadOnly: false });
+      return client.query(
+        "UPDATE users SET email = $1, password_hash = $2, session_version = session_version + $3 WHERE id = $4 RETURNING *",
+        [email, passwordHash, nextPassword ? 1 : 0, req.authUser.id]
+      );
     });
+    if (!rows[0]) return fail(res, 404, "Account not found.");
+    if (nextPassword) setSessionCookie(res, rows[0], req.sessionExpiresAt, req.supportOverride);
+    reply(res, 200, { user: publicUser(rows[0]) });
+  } catch (error) {
+    if (error.code === "23505") return fail(res, 409, "That email address is already associated with an account.");
+    console.error("Could not update account:", error.message);
+    fail(res, 503, "Could not update the account using PostgreSQL.");
+  }
+});
+
+app.get("/api/team", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res)) return;
+  const organizationId = selectedOrganization(req);
+  try {
+    const result = organizationId == null
+      ? await readQuery("SELECT * FROM users WHERE role <> 'Super Admin' ORDER BY id")
+      : await readQuery("SELECT * FROM users WHERE organization_id = $1 ORDER BY id", [organizationId], { organizationId });
+    reply(res, 200, result.rows.map(publicUser));
+  } catch (error) {
+    console.error("Could not list team:", error.message);
+    fail(res, 503, "Could not list team using PostgreSQL.");
+  }
+});
+
+app.post("/api/team/:id/approve", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res, "approve staff account")) return;
+  const organizationId = selectedOrganization(req);
+  if (!organizationId) return fail(res, 403, "Choose an organization support override before approving staff.");
+  const branchId = Number(req.body.branch_id || req.authUser.branch_id);
+  try {
+    const result = await auditSupportWriteIfNeeded(req, "approve staff account", async (client) => {
+      await setContext(client, { organizationId, globalReadOnly: false });
+      const { rows: branches } = await client.query(
+        "SELECT id FROM branches WHERE id = $1 AND organization_id = $2 AND status = 'Active' LIMIT 1",
+        [branchId, organizationId]
+      );
+      if (!branches[0]) {
+        const error = new Error("INVALID_BRANCH");
+        throw error;
+      }
+      return client.query(
+        `UPDATE users SET status = 'Active', approved_at = NOW(), approved_by = $1, branch_id = $2
+         WHERE id = $3 AND organization_id = $4 AND status = 'Pending'
+         RETURNING *`,
+        [req.authUser.user_uuid, branchId, Number(req.params.id), organizationId]
+      );
+    });
+    if (result === null) return fail(res, 400, "Choose an active branch in this organization before approving the account.");
+    if (!result.rows[0]) return fail(res, 404, "Account request not found or is no longer pending.");
+    reply(res, 200, {
+      user: publicUser(result.rows[0]),
+      message: `${result.rows[0].full_name} is active. They can sign in using the email and password they created at registration.`
+    });
+  } catch (error) {
+    if (error.message === "INVALID_BRANCH") return fail(res, 400, "Choose an active branch in this organization before approving the account.");
+    console.error("Could not approve staff account:", error.message);
+    fail(res, 503, "Could not approve the staff account using PostgreSQL.");
+  }
+});
+
+app.get("/api/invitations", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res)) return;
+  const organizationId = selectedOrganization(req);
+  try {
+    const result = organizationId == null
+      ? await readQuery("SELECT * FROM invitation_codes ORDER BY created_at DESC")
+      : await readQuery("SELECT * FROM invitation_codes WHERE organization_id = $1 ORDER BY created_at DESC", [organizationId], { organizationId });
+    reply(res, 200, result.rows.map(invitationStatus));
+  } catch (error) {
+    console.error("Could not list invitations:", error.message);
+    fail(res, 503, "Could not list invitations using PostgreSQL.");
+  }
+});
+
+app.post("/api/invitations", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res, "create staff invitation")) return;
+  const organizationId = selectedOrganization(req);
+  const role = req.body.role;
+  const count = req.body.count === undefined ? 1 : Number(req.body.count);
+  const branchId = Number(req.body.branch_id || req.authUser.branch_id);
+  const activationStatus = req.body.activation_status === "Active" ? "Active" : "Pending";
+  if (!allowedRoles.includes(role)) return fail(res, 400, "Choose an organization staff role; Super Admin invitations are not permitted.");
+  if (!Number.isInteger(count) || count < 1 || count > 50) return fail(res, 400, "Create between 1 and 50 invitation codes at a time.");
+  if (!organizationId) return fail(res, 400, "Choose an active branch in your organization.");
+  try {
+    const invitations = await auditSupportWriteIfNeeded(req, "create staff invitation", async (client) => {
+      await setContext(client, { organizationId, globalReadOnly: false });
+      const { rows: branchRows } = await client.query(
+        "SELECT id FROM branches WHERE id = $1 AND organization_id = $2 AND status = 'Active' LIMIT 1",
+        [branchId, organizationId]
+      );
+      if (!branchRows[0]) {
+        const error = new Error("INVALID_BRANCH");
+        throw error;
+      }
+      const created = [];
+      for (let index = 0; index < count; index += 1) {
+        const code = `DRM-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const { rows } = await client.query(
+          `INSERT INTO invitation_codes
+            (organization_id, branch_id, role, activation_status, code_hash, created_by, expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
+          [organizationId, branchId, role, activationStatus, hashInvitation(code), req.authUser.id, expiresAt]
+        );
+        created.push({ invitation: invitationStatus(rows[0]), code });
+      }
+      return created;
+    });
+    const first = invitations[0];
+    reply(res, 201, { invitations, invitation: first.invitation, code: first.code });
+  } catch (error) {
+    if (error.message === "INVALID_BRANCH") return fail(res, 400, "Choose an active branch in your organization.");
+    console.error("Could not create invitations:", error.message);
+    fail(res, 503, "Could not create invitations using PostgreSQL.");
+  }
+});
+
+app.post("/api/invitations/:id/revoke", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res, "revoke staff invitation")) return;
+  const organizationId = selectedOrganization(req);
+  if (!organizationId) return fail(res, 404, "Invitation not found in your organization.");
+  try {
+    const result = await auditSupportWriteIfNeeded(req, "revoke staff invitation", async (client) => {
+      await setContext(client, { organizationId, globalReadOnly: false });
+      return client.query(
+        `UPDATE invitation_codes SET revoked_at = NOW(), revoked_by = $1
+         WHERE id = $2 AND organization_id = $3 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > NOW()
+         RETURNING *`,
+        [req.authUser.id, Number(req.params.id), organizationId]
+      );
+    });
+    if (!result.rows[0]) return fail(res, 409, "Only unused, active invitations can be revoked.");
+    reply(res, 200, { invitation: invitationStatus(result.rows[0]) });
+  } catch (error) {
+    console.error("Could not revoke invitation:", error.message);
+    fail(res, 503, "Could not revoke the invitation using PostgreSQL.");
+  }
+});
+
+app.get("/api/support-override-audit", authenticate, async (req, res) => {
+  if (!await authorizeTenantAdmin(req, res)) return;
+  const organizationId = selectedOrganization(req);
+  try {
+    const result = organizationId == null
+      ? await readQuery("SELECT * FROM support_override_audit ORDER BY created_at DESC")
+      : await readQuery("SELECT * FROM support_override_audit WHERE organization_id = $1 ORDER BY created_at DESC", [organizationId], { organizationId });
+    reply(res, 200, result.rows);
+  } catch (error) {
+    console.error("Could not read support audit:", error.message);
+    fail(res, 503, "Could not read support audit using PostgreSQL.");
+  }
+});
+
+app.post("/api/password/forgot", async (req, res) => {
+  if (!requirePool(res)) return;
+  const genericMessage = "If an active account matches that email, a password reset link will be sent.";
+  if (process.env.NODE_ENV !== "test" && !process.env.PASSWORD_RESET_EMAIL_WEBHOOK_URL) {
+    return fail(res, 503, "Password reset delivery is not configured. Contact your administrator.");
+  }
+  const email = String(req.body.email || "").trim().toLowerCase();
+  if (!validEmail(email)) return reply(res, 200, { message: genericMessage });
+
+  const token = crypto.randomBytes(32).toString("base64url");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  try {
+    const user = await transaction(async (client) => {
+      await setContext(client, { globalReadOnly: true });
+      await client.query("SELECT set_config('app.password_reset', $1, true)", ["true"]);
+      const { rows } = await client.query(
+        `SELECT u.id, u.email, u.status, u.organization_id, o.settings
+         FROM users u LEFT JOIN organizations o ON o.id = u.organization_id
+         WHERE lower(u.email) = lower($1) LIMIT 1`,
+        [email]
+      );
+      const matchingUser = rows[0];
+      if (!matchingUser || !["Active", "Pending"].includes(matchingUser.status)) return null;
+      await client.query(
+        "UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL",
+        [matchingUser.id]
+      );
+      await client.query(
+        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '30 minutes')`,
+        [matchingUser.id, tokenHash]
+      );
+      return matchingUser;
+    });
+    if (!user) return reply(res, 200, { message: genericMessage });
+
+    if (process.env.NODE_ENV !== "test") {
+      const webhook = new URL(process.env.PASSWORD_RESET_EMAIL_WEBHOOK_URL);
+      if (webhook.protocol !== "https:" || webhook.username || webhook.password ||
+        !process.env.PASSWORD_RESET_EMAIL_WEBHOOK_SECRET || !process.env.PUBLIC_APP_URL) {
+        return fail(res, 503, "Password reset delivery is not configured securely.");
+      }
+      const appUrl = new URL(process.env.PUBLIC_APP_URL);
+      if (appUrl.protocol !== "https:" || appUrl.username || appUrl.password) {
+        return fail(res, 503, "Password reset delivery is not configured securely.");
+      }
+      const resetUrl = new URL("/", appUrl);
+      resetUrl.searchParams.set("reset_token", token);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const delivery = await fetch(webhook, {
+          method: "POST",
+          redirect: "error",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.PASSWORD_RESET_EMAIL_WEBHOOK_SECRET}`
+          },
+          body: JSON.stringify({
+            to: user.email,
+            subject: "Reset your DRAMAN account password",
+            reset_url: resetUrl.toString(),
+            expires_in_minutes: 30
+          })
+        });
+        if (!delivery.ok) return fail(res, 503, "Could not deliver the password reset email.");
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    reply(res, 200, {
+      message: genericMessage,
+      ...(process.env.NODE_ENV === "test" ? { test_reset_token: token } : {})
+    });
+  } catch (error) {
+    console.error("Could not issue password reset:", error.name || "Error");
+    fail(res, 503, "Could not request a password reset using PostgreSQL.");
+  }
+});
+
+app.post("/api/password/reset", async (req, res) => {
+  if (!requirePool(res)) return;
+  const token = String(req.body.token || "");
+  const password = String(req.body.password || "");
+  if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return fail(res, 400, "The password reset link is invalid or expired.");
+  if (password.length > 128) return fail(res, 400, "Choose a password with no more than 128 characters.");
+  try {
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const resetResult = await transaction(async (client) => {
+      await setContext(client, { globalReadOnly: true });
+      await client.query("SELECT set_config('app.password_reset', $1, true)", ["true"]);
+      const { rows } = await client.query(
+        `SELECT t.id AS token_id, t.user_id, u.organization_id, u.status, o.settings
+         FROM password_reset_tokens t
+         JOIN users u ON u.id = t.user_id
+         LEFT JOIN organizations o ON o.id = u.organization_id
+         WHERE t.token_hash = $1 AND t.used_at IS NULL AND t.expires_at > NOW()
+         FOR UPDATE OF t`,
+        [tokenHash]
+      );
+      const reset = rows[0];
+      if (!reset || !["Active", "Pending"].includes(reset.status)) return { error: "INVALID_TOKEN" };
+      const settings = effectiveSettings(reset.organization_id == null ? null : { settings: reset.settings }).security;
+      if (password.length < settings.minimum_password_length) {
+        return { error: "PASSWORD_POLICY", minimum: settings.minimum_password_length };
+      }
+      const passwordHash = await bcrypt.hash(password, 12);
+      await setContext(client, {
+        organizationId: reset.organization_id,
+        userId: reset.user_id,
+        globalReadOnly: false
+      });
+      await client.query(
+        "UPDATE users SET password_hash = $1, session_version = session_version + 1 WHERE id = $2",
+        [passwordHash, reset.user_id]
+      );
+      await client.query(
+        "UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL",
+        [reset.user_id]
+      );
+      return { user_id: reset.user_id };
+    });
+    if (resetResult.error === "PASSWORD_POLICY") {
+      return fail(res, 400, `Choose a password with at least ${resetResult.minimum} characters.`);
+    }
+    if (resetResult.error) return fail(res, 400, "The password reset link is invalid or expired.");
+    reply(res, 200, { message: "Your password has been reset. Sign in with your new password." });
+  } catch (error) {
+    console.error("Could not reset password:", error.message);
+    fail(res, 503, "Could not reset the password using PostgreSQL.");
+  }
+});
+
+function baseBusinessSettings(organization) {
+  const security = effectiveSettings(organization).security;
+  return {
+    business: {
+      company_name: organization && organization.name || "DRAMAN Loan Services",
+      logo_data: "",
+      contact_phone: "",
+      contact_email: "",
+      receipt_footer: "Thank you for your payment.",
+      sms_enabled: false,
+      sms_sender_id: ""
+    },
+    loan: {
+      default_interest_rate: 12,
+      processing_fee: 1000,
+      grace_period_days: 3,
+      late_penalty_rate: 3,
+      approval_threshold: 50000
+    },
+    security: {
+      ...defaultSettings.security,
+      permissions: defaultPermissions,
+      ...security,
+      permissions: security.permissions || defaultPermissions
+    }
+  };
+}
+
+app.get("/api/settings", authenticate, async (req, res) => {
+  if (!requirePool(res)) return;
+  const organizationId = businessOrganization(req);
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    if (organizationId == null) return reply(res, 200, baseBusinessSettings(null));
+    const settings = await readQuery(
+      `SELECT o.id, o.name, o.settings, b.company_name, b.logo_path, b.contact_phone,
+              b.contact_email, b.receipt_footer, b.sms_provider,
+              l.default_interest_rate, l.processing_fee, l.penalty_rate, l.grace_period_days, l.max_auto_approval_amount
+       FROM organizations o
+       LEFT JOIN business_settings b ON b.organization_id = o.id
+       LEFT JOIN loan_settings l ON l.organization_id = o.id
+       WHERE o.id = $1 LIMIT 1`,
+      [organizationId],
+      { organizationId }
+    );
+    const row = settings.rows[0];
+    if (!row) return fail(res, 404, "Organization settings not found.");
+    const data = baseBusinessSettings({ name: row.name, settings: row.settings });
+    data.business = {
+      ...data.business,
+      company_name: row.company_name || row.name,
+      logo_data: row.logo_path || "",
+      contact_phone: row.contact_phone || "",
+      contact_email: row.contact_email || "",
+      receipt_footer: row.receipt_footer || data.business.receipt_footer,
+      sms_enabled: Boolean(row.sms_provider),
+      sms_sender_id: row.sms_provider || ""
+    };
+    data.loan = {
+      ...data.loan,
+      default_interest_rate: Number(row.default_interest_rate ?? data.loan.default_interest_rate),
+      processing_fee: Number(row.processing_fee ?? data.loan.processing_fee),
+      grace_period_days: Number(row.grace_period_days ?? data.loan.grace_period_days),
+      late_penalty_rate: Number(row.penalty_rate ?? data.loan.late_penalty_rate),
+      approval_threshold: Number(row.max_auto_approval_amount ?? data.loan.approval_threshold)
+    };
+    reply(res, 200, data);
+  } catch (error) {
+    console.error("Could not read settings:", error.message);
+    fail(res, 503, "Could not read organization settings using PostgreSQL.");
+  }
+});
+
+app.put("/api/settings/:section", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "settings");
+  if (!organizationId) return fail(res, 403, "Settings can only be changed within an organization.");
+  if (!["Admin", "Super Admin"].includes(req.authUser.role)) return fail(res, 403, "Administrator permission required to change settings.");
+  const section = req.params.section;
+  if (!["business", "loan", "security"].includes(section)) return fail(res, 404, "Settings section not found.");
+  const input = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const result = await businessTransaction(req, organizationId, `update ${section} settings`, async (client) => {
+      if (section === "business") {
+        const companyName = String(input.company_name || "").trim();
+        const contactPhone = String(input.contact_phone || "").trim();
+        const contactEmail = String(input.contact_email || "").trim();
+        const footer = String(input.receipt_footer || "").trim();
+        const logo = String(input.logo_data || "");
+        const smsSender = input.sms_enabled ? String(input.sms_sender_id || "").trim() : "";
+        if (companyName.length < 2 || companyName.length > 180 || contactPhone.length > 40 ||
+          contactEmail && !validEmail(contactEmail) || footer.length > 1000 ||
+          logo.length > 1400000 || smsSender.length > 80) {
+          return { error: "INVALID_SETTINGS" };
+        }
+        const { rows } = await client.query(
+          `INSERT INTO business_settings
+            (organization_id, company_name, logo_path, contact_phone, contact_email, receipt_footer, sms_provider, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (organization_id) DO UPDATE SET
+             company_name = EXCLUDED.company_name, logo_path = EXCLUDED.logo_path,
+             contact_phone = EXCLUDED.contact_phone, contact_email = EXCLUDED.contact_email,
+             receipt_footer = EXCLUDED.receipt_footer, sms_provider = EXCLUDED.sms_provider,
+             updated_at = NOW()
+           RETURNING *`,
+          [organizationId, companyName, logo || null, contactPhone || null, contactEmail || null, footer || null, smsSender || null]
+        );
+        return { business: rows[0] };
+      }
+      if (section === "loan") {
+        const defaultInterestRate = finiteAmount(input.default_interest_rate, { max: 1000 });
+        const processingFee = finiteAmount(input.processing_fee, { max: 1000000000 });
+        const gracePeriod = Number(input.grace_period_days);
+        const penaltyRate = finiteAmount(input.late_penalty_rate, { max: 1000 });
+        const approvalThreshold = finiteAmount(input.approval_threshold, { max: 1000000000 });
+        if (defaultInterestRate === null || processingFee === null || !Number.isInteger(gracePeriod) ||
+          gracePeriod < 0 || gracePeriod > 3650 || penaltyRate === null || approvalThreshold === null) {
+          return { error: "INVALID_SETTINGS" };
+        }
+        const { rows } = await client.query(
+          `INSERT INTO loan_settings
+            (organization_id, default_interest_rate, processing_fee, penalty_rate, grace_period_days, max_auto_approval_amount, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())
+           ON CONFLICT (organization_id) DO UPDATE SET
+             default_interest_rate = EXCLUDED.default_interest_rate, processing_fee = EXCLUDED.processing_fee,
+             penalty_rate = EXCLUDED.penalty_rate,
+             grace_period_days = EXCLUDED.grace_period_days, max_auto_approval_amount = EXCLUDED.max_auto_approval_amount,
+             updated_at = NOW()
+           RETURNING *`,
+          [organizationId, defaultInterestRate, processingFee, penaltyRate, gracePeriod, approvalThreshold]
+        );
+        return { loan: rows[0] };
+      }
+      const { rows: organizations } = await client.query(
+        "SELECT settings FROM organizations WHERE id = $1 LIMIT 1",
+        [organizationId]
+      );
+      const current = organizations[0] && organizations[0].settings || {};
+      const security = {
+        ...defaultSettings.security,
+        ...(current.security || {}),
+        ...input,
+        permissions: input.permissions && typeof input.permissions === "object"
+          ? input.permissions
+          : (current.security && current.security.permissions) || defaultPermissions
+      };
+      const minimumPasswordLength = Number(security.minimum_password_length);
+      const sessionTimeout = Number(security.session_timeout_hours);
+      if (!Number.isInteger(minimumPasswordLength) || minimumPasswordLength < 10 || minimumPasswordLength > 128 ||
+        !Number.isFinite(sessionTimeout) || sessionTimeout < 1 || sessionTimeout > 720) {
+        return { error: "INVALID_SETTINGS" };
+      }
+      for (const role of staffRoles) {
+        const permissions = security.permissions[role];
+        if (!Array.isArray(permissions) || permissions.some((name) =>
+          !["dashboard", "customers", "loans", "payments", "inventory", "reports", "agreements"].includes(name)
+        )) return { error: "INVALID_SETTINGS" };
+      }
+      const nextOrganizationSettings = { ...current, security };
+      await client.query(
+        "UPDATE organizations SET settings = $1::jsonb WHERE id = $2 RETURNING id",
+        [JSON.stringify(nextOrganizationSettings), organizationId]
+      );
+      return { security };
+    });
+    if (result.error === "INVALID_SETTINGS") return fail(res, 400, "One or more settings values are invalid.");
+    const updatedSettings = await readQuery(
+      `SELECT o.id, o.name, o.settings, b.company_name, b.logo_path, b.contact_phone,
+              b.contact_email, b.receipt_footer, b.sms_provider,
+              l.default_interest_rate, l.processing_fee, l.penalty_rate, l.grace_period_days, l.max_auto_approval_amount
+       FROM organizations o
+       LEFT JOIN business_settings b ON b.organization_id = o.id
+       LEFT JOIN loan_settings l ON l.organization_id = o.id
+       WHERE o.id = $1 LIMIT 1`,
+      [organizationId],
+      { organizationId }
+    );
+    const row = updatedSettings.rows[0];
+    if (!row) return fail(res, 404, "Organization settings not found.");
+    const data = baseBusinessSettings({ name: row.name, settings: row.settings });
+    data.business = {
+      ...data.business,
+      company_name: row.company_name || row.name,
+      logo_data: row.logo_path || "",
+      contact_phone: row.contact_phone || "",
+      contact_email: row.contact_email || "",
+      receipt_footer: row.receipt_footer || data.business.receipt_footer,
+      sms_enabled: Boolean(row.sms_provider),
+      sms_sender_id: row.sms_provider || ""
+    };
+    data.loan = {
+      ...data.loan,
+      default_interest_rate: Number(row.default_interest_rate ?? data.loan.default_interest_rate),
+      processing_fee: Number(row.processing_fee ?? data.loan.processing_fee),
+      grace_period_days: Number(row.grace_period_days ?? data.loan.grace_period_days),
+      late_penalty_rate: Number(row.penalty_rate ?? data.loan.late_penalty_rate),
+      approval_threshold: Number(row.max_auto_approval_amount ?? data.loan.approval_threshold)
+    };
+    reply(res, 200, data);
+  } catch (error) {
+    console.error("Could not update settings:", error.message);
+    fail(res, 503, "Could not update organization settings using PostgreSQL.");
+  }
+});
+
+app.get("/api/customers", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "customers");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? `SELECT c.*, g.full_name AS guarantor_name, g.phone AS guarantor_phone,
+                g.relationship, g.national_id AS guarantor_id, g.address AS guarantor_address
+         FROM customers c LEFT JOIN LATERAL
+           (SELECT * FROM guarantors WHERE customer_id = c.id ORDER BY id LIMIT 1) g ON TRUE
+         ORDER BY c.created_at DESC`
+      : `SELECT c.*, g.full_name AS guarantor_name, g.phone AS guarantor_phone,
+                g.relationship, g.national_id AS guarantor_id, g.address AS guarantor_address
+         FROM customers c LEFT JOIN LATERAL
+           (SELECT * FROM guarantors WHERE customer_id = c.id AND organization_id = $1 ORDER BY id LIMIT 1) g ON TRUE
+         WHERE c.organization_id = $1 ORDER BY c.created_at DESC`;
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list customers:", error.message);
+    fail(res, 503, "Could not list customers using PostgreSQL.");
+  }
+});
+
+app.post("/api/customers", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "customers");
+  if (!organizationId) return fail(res, 403, "Customers can only be created within an organization.");
+  const input = req.body || {};
+  const fullName = String(input.full_name || "").trim();
+  const nationalId = String(input.national_id || "").trim();
+  const phone = String(input.phone || "").trim();
+  const email = String(input.email || "").trim().toLowerCase();
+  if (fullName.length < 2 || fullName.length > 180 || nationalId.length < 2 || nationalId.length > 40 ||
+    phone.length < 3 || phone.length > 40 || email && !validEmail(email)) {
+    return fail(res, 400, "Enter a valid customer name, national ID, phone number, and email address.");
+  }
+  const branchId = positiveId(input.branch_id || req.authUser.branch_id);
+  if (!branchId) return fail(res, 400, "Choose an active branch in this organization.");
+  const customerCode = `CUS-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+  try {
+    const customer = await businessTransaction(req, organizationId, "create customer", async (client) => {
+      const branch = await resolveBusinessBranch(client, req, organizationId, branchId);
+      if (!branch) return { error: "INVALID_BRANCH" };
+      const { rows } = await client.query(
+        `INSERT INTO customers
+          (organization_id, branch_id, customer_code, full_name, national_id, phone, alt_phone, email,
+           gender, dob, occupation, monthly_income, county, estate, address, photo, id_front, id_back, signature)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+         RETURNING *`,
+        [
+          organizationId, branch.id, customerCode, fullName, nationalId, phone,
+          String(input.alt_phone || "").slice(0, 40) || null, email || null,
+          String(input.gender || "").slice(0, 40) || null, validDate(input.dob) ? input.dob : null,
+          String(input.occupation || "").slice(0, 140) || null,
+          finiteAmount(input.monthly_income || 0, { max: 1000000000 }),
+          String(input.county || "").slice(0, 80) || null, String(input.estate || "").slice(0, 140) || null,
+          String(input.address || "").slice(0, 2000) || null, input.photo || null,
+          input.id_front || null, input.id_back || null, input.signature || null
+        ]
+      );
+      const created = rows[0];
+      const guarantorName = String(input.guarantor_name || "").trim();
+      const guarantorPhone = String(input.guarantor_phone || "").trim();
+      if (guarantorName || guarantorPhone) {
+        if (guarantorName.length < 2 || guarantorPhone.length < 3 || guarantorName.length > 180 || guarantorPhone.length > 40) {
+          return { error: "INVALID_GUARANTOR" };
+        }
+        await client.query(
+          `INSERT INTO guarantors
+            (organization_id, branch_id, customer_id, full_name, national_id, phone, relationship, address)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            organizationId, branch.id, created.id, guarantorName,
+            String(input.guarantor_id || "").slice(0, 40) || null,
+            guarantorPhone, String(input.relationship || "").slice(0, 80) || null,
+            String(input.guarantor_address || "").slice(0, 2000) || null
+          ]
+        );
+        return { ...created, guarantor_name: guarantorName, guarantor_phone: guarantorPhone };
+      }
+      return created;
+    });
+    if (customer.error === "INVALID_BRANCH") return fail(res, 400, "Choose an active branch in this organization.");
+    if (customer.error === "INVALID_GUARANTOR") return fail(res, 400, "Enter a valid guarantor name and phone number.");
+    reply(res, 201, customer);
+  } catch (error) {
+    if (error.code === "23505") return fail(res, 409, "That national ID is already registered in this organization.");
+    console.error("Could not create customer:", error.message);
+    fail(res, 503, "Could not create the customer using PostgreSQL.");
+  }
+});
+
+app.delete("/api/customers/:id", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "customers");
+  if (!organizationId) return fail(res, 403, "Customer records can only be deleted within an organization.");
+  if (!["Admin", "Super Admin"].includes(req.authUser.role)) return fail(res, 403, "Administrator permission required to delete customers.");
+  const customerId = positiveId(req.params.id);
+  if (!customerId) return fail(res, 400, "Choose a valid customer.");
+  try {
+    const result = await businessTransaction(req, organizationId, "delete customer", async (client) =>
+      client.query(
+        "DELETE FROM customers WHERE id = $1 AND organization_id = $2 RETURNING id",
+        [customerId, organizationId]
+      )
+    );
+    if (!result.rows[0]) return fail(res, 404, "Customer not found in this organization.");
+    reply(res, 200, { message: "Customer deleted." });
+  } catch (error) {
+    if (error.code === "23503") return fail(res, 409, "This customer has linked business records and cannot be deleted.");
+    console.error("Could not delete customer:", error.message);
+    fail(res, 503, "Could not delete the customer using PostgreSQL.");
+  }
+});
+
+app.delete("/api/customers", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "customers");
+  if (!organizationId || !["Admin", "Super Admin"].includes(req.authUser.role)) {
+    return fail(res, 403, "Administrator support override required to clear customer records.");
+  }
+  try {
+    const result = await businessTransaction(req, organizationId, "clear customer and linked business records", async (client) => {
+      const statements = [
+        "DELETE FROM agreements WHERE organization_id = $1",
+        "DELETE FROM installment_payments WHERE organization_id = $1",
+        "DELETE FROM sales WHERE organization_id = $1",
+        "DELETE FROM payments WHERE organization_id = $1",
+        "DELETE FROM penalties WHERE organization_id = $1",
+        "DELETE FROM loan_schedule WHERE organization_id = $1",
+        "DELETE FROM loans WHERE organization_id = $1",
+        "DELETE FROM guarantors WHERE organization_id = $1",
+        "DELETE FROM customers WHERE organization_id = $1"
+      ];
+      let deleted = 0;
+      for (const statement of statements) {
+        const { rowCount } = await client.query(statement, [organizationId]);
+        deleted += rowCount || 0;
+      }
+      return { deleted };
+    });
+    reply(res, 200, { message: "Customer and linked business records cleared.", deleted: result.deleted });
+  } catch (error) {
+    console.error("Could not clear customer records:", error.message);
+    fail(res, 503, "Could not clear customer records using PostgreSQL.");
+  }
+});
+
+app.get("/api/loans", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "loans");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? `SELECT l.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                COALESCE(u.full_name, 'Unassigned') AS assigned_officer
+         FROM loans l JOIN customers c ON c.id = l.customer_id
+         LEFT JOIN users u ON u.id = l.assigned_officer ORDER BY l.created_at DESC`
+      : `SELECT l.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                COALESCE(u.full_name, 'Unassigned') AS assigned_officer
+         FROM loans l JOIN customers c ON c.id = l.customer_id AND c.organization_id = l.organization_id
+         LEFT JOIN users u ON u.id = l.assigned_officer AND u.organization_id = l.organization_id
+         WHERE l.organization_id = $1 ORDER BY l.created_at DESC`;
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list loans:", error.message);
+    fail(res, 503, "Could not list loans using PostgreSQL.");
+  }
+});
+
+app.post("/api/loans", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "loans");
+  if (!organizationId) return fail(res, 403, "Loans can only be created within an organization.");
+  const input = req.body || {};
+  const customerId = positiveId(input.customer_id);
+  const principal = finiteAmount(input.principal_amount, { min: 0.01 });
+  const interestRate = finiteAmount(input.interest_rate, { max: 1000 });
+  const processingFee = finiteAmount(input.processing_fee || 0, { max: 1000000000 });
+  const duration = Number(input.duration);
+  const frequency = input.repayment_frequency;
+  if (!customerId || principal === null || interestRate === null || processingFee === null ||
+    !Number.isInteger(duration) || duration < 1 || duration > 600 ||
+    !["Daily", "Weekly", "Monthly"].includes(frequency) || !validDate(input.due_date) ||
+    input.due_date < new Date().toISOString().slice(0, 10)) {
+    return fail(res, 400, "Enter valid customer, amount, installment, frequency, and due-date details.");
+  }
+  const interest = Math.round(principal * interestRate) / 100;
+  const totalPayable = Math.round((principal + interest + processingFee) * 100) / 100;
+  const loanCode = `LN-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+  try {
+    const loan = await businessTransaction(req, organizationId, "create loan", async (client) => {
+      const { rows: customers } = await client.query(
+        "SELECT id, organization_id, branch_id, full_name, phone FROM customers WHERE id = $1 AND organization_id = $2 LIMIT 1",
+        [customerId, organizationId]
+      );
+      const customer = customers[0];
+      if (!customer || !await resolveBusinessBranch(client, req, organizationId, customer.branch_id)) {
+        return { error: "CUSTOMER_NOT_FOUND" };
+      }
+      const { rows: loanSettings } = await client.query(
+        "SELECT max_auto_approval_amount FROM loan_settings WHERE organization_id = $1 LIMIT 1",
+        [organizationId]
+      );
+      const approvalThreshold = Number(loanSettings[0] && loanSettings[0].max_auto_approval_amount || 50000);
+      const status = totalPayable >= approvalThreshold ? "Pending" : "Active";
+      const { rows } = await client.query(
+        `INSERT INTO loans
+          (organization_id, branch_id, loan_code, customer_id, principal_amount, interest_rate,
+           processing_fee, total_payable, total_paid, balance, repayment_frequency, start_date,
+           due_date, status, assigned_officer, approved_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, $9, CURRENT_DATE, $10, $11, $12, $13)
+         RETURNING *`,
+        [
+          organizationId, customer.branch_id, loanCode, customer.id, principal, interestRate,
+          processingFee, totalPayable, frequency, input.due_date, status,
+          req.authUser.id, status === "Active" ? req.authUser.id : null
+        ]
+      );
+      const created = rows[0];
+      const intervalDays = frequency === "Daily" ? 1 : frequency === "Weekly" ? 7 : 30;
+      const dueDate = new Date(`${input.due_date}T00:00:00Z`);
+      let allocated = 0;
+      for (let index = 0; index < duration; index += 1) {
+        const installment = index === duration - 1
+          ? Math.round((totalPayable - allocated) * 100) / 100
+          : Math.round((totalPayable / duration) * 100) / 100;
+        allocated += installment;
+        const installmentDate = new Date(dueDate.getTime() - (duration - index - 1) * intervalDays * 86400000);
+        await client.query(
+          `INSERT INTO loan_schedule
+            (organization_id, branch_id, loan_id, installment_number, due_date, expected_amount, paid_amount, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 0, 'Pending')`,
+          [organizationId, customer.branch_id, created.id, index + 1, installmentDate.toISOString().slice(0, 10), installment]
+        );
+      }
+      return { ...created, customer_name: customer.full_name, customer_phone: customer.phone, assigned_officer: req.authUser.full_name };
+    });
+    if (loan.error) return fail(res, 404, "Customer not found in this organization or branch.");
+    reply(res, 201, loan);
+  } catch (error) {
+    console.error("Could not create loan:", error.message);
+    fail(res, 503, "Could not create the loan using PostgreSQL.");
+  }
+});
+
+app.post("/api/loans/:id/approve", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "loans");
+  if (!organizationId || !["Admin", "Super Admin"].includes(req.authUser.role)) {
+    return fail(res, 403, "Administrator permission required to approve loans.");
+  }
+  const loanId = positiveId(req.params.id);
+  if (!loanId) return fail(res, 400, "Choose a valid loan.");
+  try {
+    const result = await businessTransaction(req, organizationId, "approve loan", async (client) =>
+      client.query(
+        `UPDATE loans SET status = 'Active', approved_by = $1
+         WHERE id = $2 AND organization_id = $3 AND status = 'Pending'
+         RETURNING *`,
+        [req.authUser.id, loanId, organizationId]
+      )
+    );
+    if (!result.rows[0]) return fail(res, 404, "Pending loan not found in this organization.");
+    reply(res, 200, result.rows[0]);
+  } catch (error) {
+    console.error("Could not approve loan:", error.message);
+    fail(res, 503, "Could not approve the loan using PostgreSQL.");
+  }
+});
+
+app.get("/api/payments", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "payments");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? `SELECT p.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                l.loan_code, u.full_name AS received_by_name
+         FROM payments p
+         JOIN customers c ON c.id = p.customer_id
+         JOIN loans l ON l.id = p.loan_id
+         LEFT JOIN users u ON u.id = p.received_by
+         ORDER BY p.payment_date DESC`
+      : `SELECT p.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                l.loan_code, u.full_name AS received_by_name
+         FROM payments p
+         JOIN customers c ON c.id = p.customer_id AND c.organization_id = p.organization_id
+         JOIN loans l ON l.id = p.loan_id AND l.organization_id = p.organization_id
+         LEFT JOIN users u ON u.id = p.received_by AND u.organization_id = p.organization_id
+         WHERE p.organization_id = $1 ORDER BY p.payment_date DESC`;
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list payments:", error.message);
+    fail(res, 503, "Could not list payments using PostgreSQL.");
+  }
+});
+
+app.post("/api/payments", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "payments");
+  if (!organizationId) return fail(res, 403, "Payments can only be recorded within an organization.");
+  const input = req.body || {};
+  const loanId = positiveId(input.loan_id);
+  const amount = finiteAmount(input.amount_paid, { min: 0.01 });
+  const method = input.payment_method;
+  if (!loanId || amount === null || !["Cash", "M-Pesa", "Bank Transfer", "Card"].includes(method)) {
+    return fail(res, 400, "Enter a valid loan, payment amount, and payment method.");
+  }
+  const paymentCode = `PAY-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+  try {
+    const payment = await businessTransaction(req, organizationId, "record loan payment", async (client) => {
+      const { rows: loans } = await client.query(
+        `SELECT l.*, c.full_name AS customer_name, c.phone AS customer_phone
+         FROM loans l JOIN customers c ON c.id = l.customer_id AND c.organization_id = l.organization_id
+         WHERE l.id = $1 AND l.organization_id = $2 AND l.status <> 'Pending'
+         FOR UPDATE OF l`,
+        [loanId, organizationId]
+      );
+      const loan = loans[0];
+      if (!loan || !await resolveBusinessBranch(client, req, organizationId, loan.branch_id)) {
+        return { error: "LOAN_NOT_FOUND" };
+      }
+      const currentBalance = finiteAmount(loan.balance);
+      if (currentBalance === null || amount > currentBalance) return { error: "PAYMENT_EXCEEDS_BALANCE" };
+      const balanceAfter = Math.max(0, Math.round((currentBalance - amount) * 100) / 100);
+      const { rows } = await client.query(
+        `INSERT INTO payments
+          (organization_id, branch_id, payment_code, loan_id, customer_id, amount_paid, payment_method,
+           transaction_code, notes, received_by, payment_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         RETURNING *`,
+        [
+          organizationId, loan.branch_id, paymentCode, loan.id, loan.customer_id, amount, method,
+          String(input.transaction_code || "").trim().slice(0, 120) || null,
+          String(input.notes || "").trim().slice(0, 2000) || null, req.authUser.id
+        ]
+      );
+      await client.query(
+        `UPDATE loans
+         SET total_paid = total_paid + $1, balance = GREATEST(balance - $1, 0),
+             status = CASE WHEN GREATEST(balance - $1, 0) = 0 THEN 'Completed' ELSE status END
+         WHERE id = $2 AND organization_id = $3`,
+        [amount, loan.id, organizationId]
+      );
+      let unapplied = amount;
+      const { rows: schedule } = await client.query(
+        `SELECT id, expected_amount, paid_amount FROM loan_schedule
+         WHERE loan_id = $1 AND organization_id = $2 ORDER BY installment_number FOR UPDATE`,
+        [loan.id, organizationId]
+      );
+      for (const installment of schedule) {
+        if (unapplied <= 0) break;
+        const remaining = Math.max(0, Number(installment.expected_amount) - Number(installment.paid_amount));
+        if (!remaining) continue;
+        const applied = Math.min(unapplied, remaining);
+        const paidAmount = Math.round((Number(installment.paid_amount) + applied) * 100) / 100;
+        await client.query(
+          `UPDATE loan_schedule SET paid_amount = $1,
+             status = CASE WHEN paid_amount + $2 >= expected_amount THEN 'Paid' ELSE 'Partially Paid' END
+           WHERE id = $3 AND organization_id = $4`,
+          [paidAmount, applied, installment.id, organizationId]
+        );
+        unapplied = Math.round((unapplied - applied) * 100) / 100;
+      }
+      return {
+        ...rows[0],
+        customer_name: loan.customer_name,
+        customer_phone: loan.customer_phone,
+        loan_code: loan.loan_code,
+        received_by_name: req.authUser.full_name,
+        balance_after: balanceAfter
+      };
+    });
+    if (payment.error === "LOAN_NOT_FOUND") return fail(res, 404, "Loan not found in this organization or branch.");
+    if (payment.error === "PAYMENT_EXCEEDS_BALANCE") return fail(res, 400, "Payment amount exceeds the outstanding loan balance.");
+    reply(res, 201, payment);
+  } catch (error) {
+    console.error("Could not record payment:", error.message);
+    fail(res, 503, "Could not record the payment using PostgreSQL.");
+  }
+});
+
+app.get("/api/inventory", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "inventory");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? "SELECT * FROM inventory ORDER BY created_at DESC"
+      : "SELECT * FROM inventory WHERE organization_id = $1 ORDER BY created_at DESC";
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list inventory:", error.message);
+    fail(res, 503, "Could not list inventory using PostgreSQL.");
+  }
+});
+
+app.post("/api/inventory", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "inventory");
+  if (!organizationId) return fail(res, 403, "Inventory can only be changed within an organization.");
+  const input = req.body || {};
+  const productName = String(input.product_name || "").trim();
+  const category = String(input.category || "");
+  const quantity = Number(input.quantity);
+  const buyingPrice = finiteAmount(input.buying_price);
+  const sellingPrice = finiteAmount(input.selling_price);
+  if (productName.length < 2 || productName.length > 180 || !allowedProductCategories.includes(category) ||
+    !Number.isInteger(quantity) || quantity < 0 || quantity > 100000000 ||
+    buyingPrice === null || sellingPrice === null) {
+    return fail(res, 400, "Enter a valid product name, category, stock quantity, and prices.");
+  }
+  try {
+    const product = await businessTransaction(req, organizationId, "create inventory item", async (client) => {
+      const branch = await resolveBusinessBranch(client, req, organizationId, input.branch_id);
+      if (!branch) return { error: "INVALID_BRANCH" };
+      const { rows } = await client.query(
+        `INSERT INTO inventory
+          (organization_id, branch_id, product_name, category, quantity, buying_price, selling_price,
+           description, condition, serial_number, image)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING *`,
+        [
+          organizationId, branch.id, productName, category, quantity, buyingPrice, sellingPrice,
+          String(input.description || "").slice(0, 4000) || null,
+          String(input.condition || "").slice(0, 80) || null,
+          String(input.serial_number || "").slice(0, 120) || null,
+          input.image || null
+        ]
+      );
+      return rows[0];
+    });
+    if (product.error) return fail(res, 400, "Choose an active branch in this organization.");
+    reply(res, 201, product);
+  } catch (error) {
+    console.error("Could not create inventory item:", error.message);
+    fail(res, 503, "Could not create the inventory item using PostgreSQL.");
+  }
+});
+
+app.delete("/api/inventory/:id", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "inventory");
+  if (!organizationId) return fail(res, 403, "Inventory can only be changed within an organization.");
+  const productId = positiveId(req.params.id);
+  if (!productId) return fail(res, 400, "Choose a valid inventory item.");
+  try {
+    const result = await businessTransaction(req, organizationId, "delete inventory item", async (client) =>
+      client.query(
+        "DELETE FROM inventory WHERE id = $1 AND organization_id = $2 RETURNING id",
+        [productId, organizationId]
+      )
+    );
+    if (!result.rows[0]) return fail(res, 404, "Inventory item not found in this organization.");
+    reply(res, 200, { message: "Inventory item deleted." });
+  } catch (error) {
+    if (error.code === "23503") return fail(res, 409, "This item has linked sales and cannot be deleted.");
+    console.error("Could not delete inventory item:", error.message);
+    fail(res, 503, "Could not delete the inventory item using PostgreSQL.");
+  }
+});
+
+app.delete("/api/inventory", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "inventory");
+  if (!organizationId || !["Admin", "Super Admin"].includes(req.authUser.role)) {
+    return fail(res, 403, "Administrator support override required to clear inventory.");
+  }
+  try {
+    const result = await businessTransaction(req, organizationId, "clear inventory and linked sales", async (client) => {
+      await client.query(
+        "DELETE FROM agreements WHERE organization_id = $1 AND sale_id IN (SELECT id FROM sales WHERE organization_id = $1)",
+        [organizationId]
+      );
+      await client.query(
+        "DELETE FROM installment_payments WHERE organization_id = $1",
+        [organizationId]
+      );
+      await client.query("DELETE FROM sales WHERE organization_id = $1", [organizationId]);
+      return client.query("DELETE FROM inventory WHERE organization_id = $1", [organizationId]);
+    });
+    reply(res, 200, { message: "Inventory and linked sales cleared.", deleted: result.rowCount || 0 });
+  } catch (error) {
+    console.error("Could not clear inventory:", error.message);
+    fail(res, 503, "Could not clear inventory using PostgreSQL.");
+  }
+});
+
+app.get("/api/agreements", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "agreements");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? `SELECT a.*, c.full_name AS customer_name, c.customer_code
+         FROM agreements a JOIN customers c ON c.id = a.customer_id ORDER BY a.created_at DESC`
+      : `SELECT a.*, c.full_name AS customer_name, c.customer_code
+         FROM agreements a JOIN customers c ON c.id = a.customer_id AND c.organization_id = a.organization_id
+         WHERE a.organization_id = $1 ORDER BY a.created_at DESC`;
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list agreements:", error.message);
+    fail(res, 503, "Could not list agreements using PostgreSQL.");
+  }
+});
+
+app.get("/api/sales", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessRead(req, res, "payments");
+  if (organizationId === null && !isSuperAdmin(req)) return;
+  try {
+    const query = organizationId == null
+      ? `SELECT s.*, c.full_name AS customer_name, i.product_name,
+                u.full_name AS cashier_name
+         FROM sales s JOIN inventory i ON i.id = s.inventory_id
+         LEFT JOIN customers c ON c.id = s.customer_id
+         LEFT JOIN users u ON u.id = s.sold_by
+         ORDER BY s.sale_date DESC`
+      : `SELECT s.*, c.full_name AS customer_name, i.product_name,
+                u.full_name AS cashier_name
+         FROM sales s JOIN inventory i ON i.id = s.inventory_id AND i.organization_id = s.organization_id
+         LEFT JOIN customers c ON c.id = s.customer_id AND c.organization_id = s.organization_id
+         LEFT JOIN users u ON u.id = s.sold_by AND u.organization_id = s.organization_id
+         WHERE s.organization_id = $1 ORDER BY s.sale_date DESC`;
+    const { rows } = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, rows);
+  } catch (error) {
+    console.error("Could not list sales:", error.message);
+    fail(res, 503, "Could not list sales using PostgreSQL.");
+  }
+});
+
+app.post("/api/sales", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "payments");
+  if (!organizationId) return fail(res, 403, "Sales can only be recorded within an organization.");
+  const input = req.body || {};
+  const inventoryId = positiveId(input.inventory_id);
+  const quantity = Number(input.quantity);
+  const paymentType = input.payment_type;
+  const downPayment = finiteAmount(input.down_payment || 0);
+  const paymentMethod = input.payment_method || "Cash";
+  if (!inventoryId || !Number.isInteger(quantity) || quantity < 1 || quantity > 100000 ||
+    !["Cash", "Installment"].includes(paymentType) || downPayment === null ||
+    !["Cash", "M-Pesa", "Bank Transfer", "Card"].includes(paymentMethod)) {
+    return fail(res, 400, "Enter a valid product, quantity, payment type, and down payment.");
+  }
+  const customerId = input.customer_id ? positiveId(input.customer_id) : null;
+  if (input.customer_id && !customerId) return fail(res, 400, "Choose a valid customer.");
+  try {
+    const sale = await businessTransaction(req, organizationId, "record inventory sale", async (client) => {
+      const { rows: products } = await client.query(
+        "SELECT * FROM inventory WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+        [inventoryId, organizationId]
+      );
+      const product = products[0];
+      if (!product || !await resolveBusinessBranch(client, req, organizationId, product.branch_id)) {
+        return { error: "PRODUCT_NOT_FOUND" };
+      }
+      if (quantity > Number(product.quantity)) return { error: "INSUFFICIENT_STOCK" };
+      let customer = null;
+      if (customerId) {
+        const { rows: customers } = await client.query(
+          "SELECT id, branch_id, full_name FROM customers WHERE id = $1 AND organization_id = $2 LIMIT 1",
+          [customerId, organizationId]
+        );
+        customer = customers[0];
+        if (!customer || Number(customer.branch_id) !== Number(product.branch_id)) return { error: "CUSTOMER_NOT_FOUND" };
+      }
+      const price = finiteAmount(product.selling_price);
+      const total = Math.round(price * quantity * 100) / 100;
+      if (downPayment > total || paymentType === "Cash" && downPayment !== total) return { error: "INVALID_DOWN_PAYMENT" };
+      const balance = Math.round((total - downPayment) * 100) / 100;
+      const { rows } = await client.query(
+        `INSERT INTO sales
+          (organization_id, branch_id, customer_id, inventory_id, quantity, selling_price,
+           payment_type, down_payment, balance, sold_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING *`,
+        [organizationId, product.branch_id, customerId, inventoryId, quantity, price, paymentType, downPayment, balance, req.authUser.id]
+      );
+      await client.query(
+        "UPDATE inventory SET quantity = quantity - $1 WHERE id = $2 AND organization_id = $3",
+        [quantity, inventoryId, organizationId]
+      );
+      if (downPayment > 0) {
+        await client.query(
+          `INSERT INTO installment_payments
+            (organization_id, branch_id, sale_id, amount_paid, payment_method, transaction_code, received_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            organizationId, product.branch_id, rows[0].id, downPayment, paymentMethod,
+            String(input.transaction_code || "").trim().slice(0, 120) || null, req.authUser.id
+          ]
+        );
+      }
+      return { ...rows[0], product_name: product.product_name, customer_name: customer && customer.full_name };
+    });
+    if (sale.error === "PRODUCT_NOT_FOUND") return fail(res, 404, "Inventory item not found in this organization or branch.");
+    if (sale.error === "CUSTOMER_NOT_FOUND") return fail(res, 404, "Customer not found in this organization and branch.");
+    if (sale.error === "INSUFFICIENT_STOCK") return fail(res, 409, "There is not enough stock to complete this sale.");
+    if (sale.error === "INVALID_DOWN_PAYMENT") return fail(res, 400, "Cash sales must be paid in full; installment down payment cannot exceed the total.");
+    reply(res, 201, sale);
+  } catch (error) {
+    console.error("Could not record sale:", error.message);
+    fail(res, 503, "Could not record the sale using PostgreSQL.");
+  }
+});
+
+app.post("/api/sales/:id/payments", authenticate, async (req, res) => {
+  const organizationId = authorizeBusinessWrite(req, res, "payments");
+  if (!organizationId) return fail(res, 403, "Sales payments can only be recorded within an organization.");
+  const saleId = positiveId(req.params.id);
+  const amount = finiteAmount(req.body.amount_paid, { min: 0.01 });
+  const method = req.body.payment_method;
+  if (!saleId || amount === null || !["Cash", "M-Pesa", "Bank Transfer", "Card"].includes(method)) {
+    return fail(res, 400, "Enter a valid sale, payment amount, and payment method.");
+  }
+  try {
+    const result = await businessTransaction(req, organizationId, "record installment sale payment", async (client) => {
+      const { rows: sales } = await client.query(
+        `SELECT s.*, i.product_name, c.full_name AS customer_name
+         FROM sales s JOIN inventory i ON i.id = s.inventory_id AND i.organization_id = s.organization_id
+         LEFT JOIN customers c ON c.id = s.customer_id AND c.organization_id = s.organization_id
+         WHERE s.id = $1 AND s.organization_id = $2 FOR UPDATE OF s`,
+        [saleId, organizationId]
+      );
+      const sale = sales[0];
+      if (!sale || !await resolveBusinessBranch(client, req, organizationId, sale.branch_id)) return { error: "SALE_NOT_FOUND" };
+      if (amount > Number(sale.balance)) return { error: "PAYMENT_EXCEEDS_BALANCE" };
+      const { rows } = await client.query(
+        `INSERT INTO installment_payments
+          (organization_id, branch_id, sale_id, amount_paid, payment_method, transaction_code, received_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [
+          organizationId, sale.branch_id, sale.id, amount, method,
+          String(req.body.transaction_code || "").trim().slice(0, 120) || null, req.authUser.id
+        ]
+      );
+      const balanceAfter = Math.max(0, Math.round((Number(sale.balance) - amount) * 100) / 100);
+      await client.query(
+        "UPDATE sales SET balance = $1 WHERE id = $2 AND organization_id = $3",
+        [balanceAfter, sale.id, organizationId]
+      );
+      return { ...rows[0], sale_id: sale.id, product_name: sale.product_name, customer_name: sale.customer_name, balance_after: balanceAfter };
+    });
+    if (result.error === "SALE_NOT_FOUND") return fail(res, 404, "Installment sale not found in this organization or branch.");
+    if (result.error === "PAYMENT_EXCEEDS_BALANCE") return fail(res, 400, "Payment amount exceeds the sale balance.");
+    reply(res, 201, result);
+  } catch (error) {
+    console.error("Could not record installment sale payment:", error.message);
+    fail(res, 503, "Could not record the installment payment using PostgreSQL.");
+  }
+});
+
+app.get("/api/summary", authenticate, async (req, res) => {
+  if (!requirePool(res)) return;
+  const organizationId = businessOrganization(req);
+  try {
+    const data = await transaction(async (client) => {
+      await setContext(client, { organizationId, globalReadOnly: true });
+      const tenantClause = organizationId == null ? "" : " WHERE organization_id = $1";
+      const values = organizationId == null ? [] : [organizationId];
+      const loanQuery = organizationId == null
+        ? `SELECT l.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                  COALESCE(u.full_name, 'Unassigned') AS assigned_officer
+           FROM loans l JOIN customers c ON c.id = l.customer_id
+           LEFT JOIN users u ON u.id = l.assigned_officer ORDER BY l.created_at DESC`
+        : `SELECT l.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                  COALESCE(u.full_name, 'Unassigned') AS assigned_officer
+           FROM loans l JOIN customers c ON c.id = l.customer_id AND c.organization_id = l.organization_id
+           LEFT JOIN users u ON u.id = l.assigned_officer AND u.organization_id = l.organization_id
+           WHERE l.organization_id = $1 ORDER BY l.created_at DESC`;
+      const paymentQuery = organizationId == null
+        ? `SELECT p.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                  l.loan_code, u.full_name AS received_by_name
+           FROM payments p JOIN customers c ON c.id = p.customer_id
+           JOIN loans l ON l.id = p.loan_id LEFT JOIN users u ON u.id = p.received_by
+           ORDER BY p.payment_date DESC`
+        : `SELECT p.*, c.full_name AS customer_name, c.phone AS customer_phone,
+                  l.loan_code, u.full_name AS received_by_name
+           FROM payments p JOIN customers c ON c.id = p.customer_id AND c.organization_id = p.organization_id
+           JOIN loans l ON l.id = p.loan_id AND l.organization_id = p.organization_id
+           LEFT JOIN users u ON u.id = p.received_by AND u.organization_id = p.organization_id
+           WHERE p.organization_id = $1 ORDER BY p.payment_date DESC`;
+      const inventoryQuery = organizationId == null
+        ? "SELECT * FROM inventory ORDER BY created_at DESC"
+        : "SELECT * FROM inventory WHERE organization_id = $1 ORDER BY created_at DESC";
+      const customerCountQuery = `SELECT COUNT(*) AS count FROM customers${tenantClause}`;
+      const [loans, payments, inventory, customerCount] = await Promise.all([
+        client.query(loanQuery, values),
+        client.query(paymentQuery, values),
+        client.query(inventoryQuery, values),
+        client.query(customerCountQuery, values)
+      ]);
+      const today = new Date().toISOString().slice(0, 10);
+      const month = today.slice(0, 7);
+      const paymentDate = (payment) => new Date(payment.payment_date).toISOString();
+      const paymentsToday = payments.rows.filter((payment) => paymentDate(payment).slice(0, 10) === today);
+      const paymentsMonth = payments.rows.filter((payment) => paymentDate(payment).slice(0, 7) === month);
+      const loanTrends = ["Active", "Pending", "Completed", "Defaulted"].map((status) => ({
+        label: status,
+        count: loans.rows.filter((loan) => loan.status === status).length
+      }));
+      const days = Array.from({ length: 7 }, (_, index) => {
+        const date = new Date(Date.now() - (6 - index) * 86400000);
+        const isoDate = date.toISOString().slice(0, 10);
+        const matching = payments.rows.filter((payment) => paymentDate(payment).slice(0, 10) === isoDate);
+        return {
+          label: date.toLocaleDateString("en", { weekday: "short" }),
+          amount: matching.reduce((sum, payment) => sum + Number(payment.amount_paid || 0), 0)
+        };
+      });
+      const inSevenDays = Date.now() + 7 * 86400000;
+      const duePayments = loans.rows.filter((loan) =>
+        Number(loan.balance) > 0 && new Date(`${String(loan.due_date).slice(0, 10)}T00:00:00Z`).getTime() <= inSevenDays
+      ).slice(0, 8);
+      const stockValue = inventory.rows.reduce((sum, item) =>
+        sum + Number(item.quantity || 0) * Number(item.buying_price || 0), 0
+      );
+      const outstandingBalance = loans.rows.reduce((sum, loan) => sum + Number(loan.balance || 0), 0);
+      return {
+        cards: {
+          totalActiveLoans: loans.rows.filter((loan) => ["Active", "Approved", "Defaulted"].includes(loan.status)).length,
+          amountCollectedToday: paymentsToday.reduce((sum, payment) => sum + Number(payment.amount_paid || 0), 0),
+          overdueLoans: loans.rows.filter((loan) =>
+            Number(loan.balance) > 0 && new Date(`${String(loan.due_date).slice(0, 10)}T00:00:00Z`).getTime() < Date.now()
+          ).length,
+          totalCustomers: Number(customerCount.rows[0] && customerCount.rows[0].count || 0),
+          inventoryStockValue: stockValue,
+          monthlyProfit: paymentsMonth.reduce((sum, payment) => sum + Number(payment.amount_paid || 0), 0),
+          outstandingBalance,
+          defaultedLoans: loans.rows.filter((loan) => loan.status === "Defaulted").length
+        },
+        repaymentSeries: days,
+        loanTrend: loanTrends,
+        recentTransactions: payments.rows.slice(0, 8),
+        duePayments,
+        lowStockAlerts: inventory.rows.filter((item) => Number(item.quantity) <= 2).slice(0, 8)
+      };
+    });
+    reply(res, 200, data);
+  } catch (error) {
+    console.error("Could not calculate dashboard summary:", error.message);
+    fail(res, 503, "Could not read dashboard data using PostgreSQL.");
+  }
+});
+
+app.get("/api/notifications", authenticate, async (req, res) => {
+  if (!requirePool(res)) return;
+  if (!businessPermission(req, "inventory")) return reply(res, 200, []);
+  const organizationId = businessOrganization(req);
+  try {
+    const query = organizationId == null
+      ? "SELECT 'low_stock' AS type, id, product_name AS title, quantity AS detail, created_at FROM inventory WHERE quantity <= 2 ORDER BY created_at DESC LIMIT 20"
+      : "SELECT 'low_stock' AS type, id, product_name AS title, quantity AS detail, created_at FROM inventory WHERE organization_id = $1 AND quantity <= 2 ORDER BY created_at DESC LIMIT 20";
+    const result = await readQuery(query, organizationId == null ? [] : [organizationId], { organizationId });
+    reply(res, 200, result.rows);
+  } catch (error) {
+    console.error("Could not list notifications:", error.message);
+    fail(res, 503, "Could not list notifications using PostgreSQL.");
+  }
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    return fail(res, 501, "This route is not yet backed by PostgreSQL and is unavailable. No local JSON state is used.");
+  }
+  const file = publicFiles[req.path];
+  if (!file) return res.status(404).send("Not found");
+  const filePath = path.join(__dirname, file);
+  fs.readFile(filePath).then((content) => {
+    res.set("Content-Type", mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream");
+    res.set("Cache-Control", "no-store");
+    res.send(content);
+  }).catch((error) => {
+    console.error(`Failed to serve ${file}:`, error.message);
+    res.status(500).send("Internal server error");
   });
+});
+
+app.use((error, req, res, next) => {
+  console.error("Request failed:", error.message);
+  fail(res, error.type === "entity.too.large" ? 413 : 400, "The request could not be processed.");
+});
+
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`DRAMAN LMS API listening on http://localhost:${PORT}`));
 }
 
 module.exports = app;
+module.exports.app = app;
+module.exports.transaction = transaction;
+module.exports.setContext = setContext;
