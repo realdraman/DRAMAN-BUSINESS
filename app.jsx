@@ -832,8 +832,9 @@ function SupportOverrideControl({ session, onSessionUpdated }) {
     if (!isOpen || override) return;
     api.get("/api/organizations")
       .then(({ data }) => {
-        setOrganizations(data);
-        setOrganizationId((current) => current || (data[0] ? String(data[0].id) : ""));
+        const organizationList = Array.isArray(data) ? data : [];
+        setOrganizations(organizationList);
+        setOrganizationId((current) => current || (organizationList[0] ? String(organizationList[0].id) : ""));
       })
       .catch((requestError) => setError(requestError.message || "Unable to list organizations."));
   }, [isOpen, override]);
@@ -887,10 +888,11 @@ function SupportOverrideControl({ session, onSessionUpdated }) {
       started = false;
       onSessionUpdated({ ...session, support_override: stopped.data.support_override });
       setIssuedCode(data.admin_invitation_code);
-      setMessage(`${data.organization.name} created. Share this one-time code with its first organization administrator.`);
+      const createdOrganization = data.organization || {};
+      setMessage(`${createdOrganization.name || "Organization"} created. Share this one-time code with its first organization administrator.`);
       setNewOrganizationName("");
       setReason("");
-      setOrganizations((current) => [...current, data.organization]);
+      if (data.organization) setOrganizations((current) => [...current, data.organization]);
     } catch (requestError) {
       setError(requestError.message || "Unable to create organization.");
       if (started) {
@@ -1014,7 +1016,7 @@ function NotificationCenter() {
     setError("");
     try {
       const { data } = await api.get("/api/notifications");
-      setNotifications(data.notifications);
+      setNotifications(Array.isArray(data) ? data : Array.isArray(data && data.notifications) ? data.notifications : []);
     } catch (requestError) {
       setError(requestError.message || "Unable to load notifications.");
     } finally {
@@ -1141,15 +1143,16 @@ function RepaymentChart({ summary, theme }) {
 
   useEffect(() => {
     if (!window.Chart || !canvasRef.current || !summary) return undefined;
+    const repaymentSeries = Array.isArray(summary.repaymentSeries) ? summary.repaymentSeries : [];
     const tickColor = theme === "dark" ? "#a4b2be" : "#65758b";
     const chart = new window.Chart(canvasRef.current, {
       type: "bar",
       data: {
-        labels: summary.repaymentSeries.map((item) => item.label),
+        labels: repaymentSeries.map((item) => item.label),
         datasets: [
           {
             label: "Collections",
-            data: summary.repaymentSeries.map((item) => item.amount),
+            data: repaymentSeries.map((item) => item.amount),
             backgroundColor: "#12385F",
             borderRadius: 6
           }
@@ -1187,13 +1190,14 @@ function LoanTrendChart({ summary, theme }) {
 
   useEffect(() => {
     if (!window.Chart || !canvasRef.current || !summary) return undefined;
+    const loanTrend = Array.isArray(summary.loanTrend) ? summary.loanTrend : [];
     const chart = new window.Chart(canvasRef.current, {
       type: "doughnut",
       data: {
-        labels: summary.loanTrend.map((item) => item.label),
+        labels: loanTrend.map((item) => item.label),
         datasets: [
           {
-            data: summary.loanTrend.map((item) => item.count),
+            data: loanTrend.map((item) => item.count),
             backgroundColor: ["#D9A441", "#1F8A70", "#087F8C", "#BF3B45"],
             borderWidth: 0
           }
@@ -1226,7 +1230,7 @@ function Dashboard({ summary, theme, canCreateLoan, onNavigate }) {
     return <div className="empty-state">Loading dashboard</div>;
   }
 
-  const cards = summary.cards;
+  const cards = summary.cards && typeof summary.cards === "object" ? summary.cards : {};
   return (
     <>
       <SectionHeading
@@ -1268,9 +1272,9 @@ function Dashboard({ summary, theme, canCreateLoan, onNavigate }) {
         </div>
       </section>
       <section className="three-column">
-        <RecentTransactions payments={summary.recentTransactions} />
-        <DuePayments loans={summary.duePayments} />
-        <LowStockAlerts items={summary.lowStockAlerts} />
+        <RecentTransactions payments={Array.isArray(summary.recentTransactions) ? summary.recentTransactions : []} />
+        <DuePayments loans={Array.isArray(summary.duePayments) ? summary.duePayments : []} />
+        <LowStockAlerts items={Array.isArray(summary.lowStockAlerts) ? summary.lowStockAlerts : []} />
       </section>
     </>
   );
@@ -2262,13 +2266,13 @@ function InventoryManagement({ inventory, refreshData, user, settings, session }
 }
 
 function Reports({ summary, loans, inventory }) {
-  const outstanding = summary?.cards.outstandingBalance ?? loans.reduce((sum, loan) => sum + Number(loan.balance || 0), 0);
-  const defaulted = summary?.cards.defaultedLoans ?? loans.filter((loan) => loan.status === "Defaulted").length;
+  const outstanding = summary?.cards?.outstandingBalance ?? loans.reduce((sum, loan) => sum + Number(loan.balance || 0), 0);
+  const defaulted = summary?.cards?.defaultedLoans ?? loans.filter((loan) => loan.status === "Defaulted").length;
   const rows = [
-    ["Daily collections", summary?.cards.amountCollectedToday || 0],
+    ["Daily collections", summary?.cards?.amountCollectedToday || 0],
     ["Outstanding balances", outstanding],
     ["Default reports", defaulted],
-    ["Stock value", summary?.cards.inventoryStockValue || 0]
+    ["Stock value", summary?.cards?.inventoryStockValue || 0]
   ];
 
   function downloadReport(format) {
@@ -2316,10 +2320,10 @@ function Reports({ summary, loans, inventory }) {
         }
       />
       <section className="metric-band">
-        <div className="metric-cell"><span className="compact muted">Daily collections</span><strong>{formatCurrency(summary?.cards.amountCollectedToday)}</strong></div>
+        <div className="metric-cell"><span className="compact muted">Daily collections</span><strong>{formatCurrency(summary?.cards?.amountCollectedToday)}</strong></div>
         <div className="metric-cell"><span className="compact muted">Outstanding balances</span><strong>{formatCurrency(outstanding)}</strong></div>
         <div className="metric-cell"><span className="compact muted">Default reports</span><strong>{defaulted}</strong></div>
-        <div className="metric-cell"><span className="compact muted">Stock value</span><strong>{formatCurrency(summary?.cards.inventoryStockValue)}</strong></div>
+        <div className="metric-cell"><span className="compact muted">Stock value</span><strong>{formatCurrency(summary?.cards?.inventoryStockValue)}</strong></div>
       </section>
       <section className="three-column">
         {["Daily collections", "Profit analysis", "Fast-selling products"].map((title, index) => (
@@ -2579,10 +2583,13 @@ function TeamAccess({ session }) {
       api.get("/api/invitations"),
       api.get("/api/branches")
     ]);
-    setTeam(teamResult.data);
-    setInvitations(inviteResult.data);
-    setBranches(branchResult.data);
-    setBranchId((current) => current || (branchResult.data[0] ? String(branchResult.data[0].id) : ""));
+    const nextTeam = Array.isArray(teamResult.data) ? teamResult.data : [];
+    const nextInvitations = Array.isArray(inviteResult.data) ? inviteResult.data : [];
+    const nextBranches = Array.isArray(branchResult.data) ? branchResult.data : [];
+    setTeam(nextTeam);
+    setInvitations(nextInvitations);
+    setBranches(nextBranches);
+    setBranchId((current) => current || (nextBranches[0] ? String(nextBranches[0].id) : ""));
   }
 
   useEffect(() => {
@@ -2603,8 +2610,9 @@ function TeamAccess({ session }) {
         branch_id: Number(branchId),
         activation_status: activationStatus
       });
-      setIssuedCodes(data.invitations.map((item) => item.code));
-      setMessage(`${data.invitations.length} ${activationStatus.toLowerCase()} invitation code${data.invitations.length === 1 ? "" : "s"} created for ${role}.`);
+      const createdInvitations = Array.isArray(data.invitations) ? data.invitations : [];
+      setIssuedCodes(createdInvitations.map((item) => item.code).filter(Boolean));
+      setMessage(`${createdInvitations.length} ${activationStatus.toLowerCase()} invitation code${createdInvitations.length === 1 ? "" : "s"} created for ${role}.`);
       await refreshAccess();
     } catch (requestError) {
       setError(requestError.message || "Unable to create invitation.");
@@ -2884,8 +2892,23 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
 
   async function refreshData() {
     const settingsResult = await api.get("/api/settings");
+    const settingsData = settingsResult.data && typeof settingsResult.data === "object" ? settingsResult.data : {};
+    const securityData = settingsData.security && typeof settingsData.security === "object" ? settingsData.security : {};
+    const nextSettings = {
+      ...initialSettings,
+      ...settingsData,
+      business: { ...initialSettings.business, ...(settingsData.business || {}) },
+      loan: { ...initialSettings.loan, ...(settingsData.loan || {}) },
+      security: {
+        ...initialSettings.security,
+        ...securityData,
+        permissions: securityData.permissions && typeof securityData.permissions === "object" && !Array.isArray(securityData.permissions)
+          ? securityData.permissions
+          : initialSettings.security.permissions
+      }
+    };
     const role = normalizeRole(session.user.role);
-    const modules = permissionsForRole(settingsResult.data.security.permissions, role);
+    const modules = permissionsForRole(nextSettings.security.permissions, role);
     const canAccess = (moduleName) => ["Admin", "Super Admin"].includes(role) || modules.includes(moduleName);
     const [summaryResult, customersResult, loansResult, paymentsResult, inventoryResult, agreementsResult] = await Promise.all([
       api.get("/api/summary"),
@@ -2895,13 +2918,22 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
       canAccess("inventory") ? api.get("/api/inventory") : Promise.resolve({ data: [] }),
       canAccess("agreements") ? api.get("/api/agreements") : Promise.resolve({ data: [] })
     ]);
-    setSummary(summaryResult.data);
-    setCustomers(customersResult.data);
-    setLoans(loansResult.data);
-    setPayments(paymentsResult.data);
-    setInventory(inventoryResult.data);
-    setAgreements(agreementsResult.data);
-    setSettings(settingsResult.data);
+    const dashboardData = summaryResult.data && typeof summaryResult.data === "object" ? summaryResult.data : {};
+    setSummary({
+      ...dashboardData,
+      cards: dashboardData.cards && typeof dashboardData.cards === "object" ? dashboardData.cards : {},
+      repaymentSeries: Array.isArray(dashboardData.repaymentSeries) ? dashboardData.repaymentSeries : [],
+      loanTrend: Array.isArray(dashboardData.loanTrend) ? dashboardData.loanTrend : [],
+      recentTransactions: Array.isArray(dashboardData.recentTransactions) ? dashboardData.recentTransactions : [],
+      duePayments: Array.isArray(dashboardData.duePayments) ? dashboardData.duePayments : [],
+      lowStockAlerts: Array.isArray(dashboardData.lowStockAlerts) ? dashboardData.lowStockAlerts : []
+    });
+    setCustomers(Array.isArray(customersResult.data) ? customersResult.data : []);
+    setLoans(Array.isArray(loansResult.data) ? loansResult.data : []);
+    setPayments(Array.isArray(paymentsResult.data) ? paymentsResult.data : []);
+    setInventory(Array.isArray(inventoryResult.data) ? inventoryResult.data : []);
+    setAgreements(Array.isArray(agreementsResult.data) ? agreementsResult.data : []);
+    setSettings(nextSettings);
   }
 
   useEffect(() => {
