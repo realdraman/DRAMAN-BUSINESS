@@ -105,7 +105,8 @@ async function setContext(client, {
   globalReadOnly = false,
   platformOverride = false,
   supportOverride = false,
-  superAdminBootstrap = false
+  superAdminBootstrap = false,
+  superAdminBootstrapEmail = ""
 } = {}) {
   await client.query("SELECT set_config('app.global_read_only', $1, true)", [globalReadOnly ? "true" : "false"]);
   await client.query("SELECT set_config('app.organization_id', $1, true)", [organizationId == null ? "" : String(organizationId)]);
@@ -113,6 +114,7 @@ async function setContext(client, {
   await client.query("SELECT set_config('app.platform_override', $1, true)", [platformOverride ? "true" : "false"]);
   await client.query("SELECT set_config('app.support_override', $1, true)", [supportOverride ? "true" : "false"]);
   await client.query("SELECT set_config('app.bootstrap_super_admin', $1, true)", [superAdminBootstrap ? "true" : "false"]);
+  await client.query("SELECT set_config('app.bootstrap_super_admin_email', $1, true)", [String(superAdminBootstrapEmail || "")]);
 }
 
 async function readQuery(query, values = [], context = {}) {
@@ -123,50 +125,75 @@ async function readQuery(query, values = [], context = {}) {
 }
 
 async function ensureSuperAdmin() {
-  if (!pool) return false;
   const email = String(process.env.SUPER_ADMIN_EMAIL || "").trim().toLowerCase();
   const password = String(process.env.SUPER_ADMIN_PASSWORD || "");
+  if (!email || !password) {
+    console.info("Skipped Super Admin bootstrap: set both SUPER_ADMIN_EMAIL and SUPER_ADMIN_PASSWORD.");
+    return false;
+  }
+  if (password.length < 10 || password.length > 128) {
+    console.info("Skipped Super Admin bootstrap: SUPER_ADMIN_PASSWORD must contain 10 to 128 characters.");
+    return false;
+  }
+  if (!validEmail(email)) {
+    console.info("Skipped Super Admin bootstrap: SUPER_ADMIN_EMAIL is invalid.");
+    return false;
+  }
+  if (!pool) {
+    console.info("Skipped Super Admin bootstrap: PostgreSQL is not configured.");
+    return false;
+  }
+
   return transaction(async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", ["draman.ensure_super_admin"]);
     await setContext(client, { globalReadOnly: true });
-    const { rows: admins } = await client.query(
-      "SELECT id FROM users WHERE role = 'Super Admin' LIMIT 1"
-    );
-    if (admins[0]) return false;
-    if (!email || !password) return false;
-    if (!validEmail(email) || password.length < 10 || password.length > 128) {
-      throw new Error("SUPER_ADMIN_EMAIL must be valid and SUPER_ADMIN_PASSWORD must contain 10 to 128 characters.");
-    }
-
-    const { rows: emailMatches } = await client.query(
-      "SELECT id FROM users WHERE lower(email) = lower($1) LIMIT 1",
+    const { rows: matches } = await client.query(
+      `SELECT id, email, password_hash, role, status, organization_id, branch_id
+       FROM users WHERE lower(email) = lower($1) LIMIT 1`,
       [email]
     );
-    if (emailMatches[0]) {
-      throw new Error("SUPER_ADMIN_EMAIL is already assigned to a non-Super Admin account.");
+    const existing = matches[0];
+    if (existing && existing.role === "Super Admin" && existing.status === "Active" &&
+      existing.organization_id == null && existing.branch_id == null &&
+      await bcrypt.compare(password, existing.password_hash)) {
+      console.info("Skipped Super Admin bootstrap: the configured account is already current.");
+      return false;
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
     const fullName = email.split("@")[0].replace(/[._-]+/g, " ").trim().slice(0, 160) || "Platform Administrator";
-    await setContext(client, { globalReadOnly: false, superAdminBootstrap: true });
+    const accountEmail = existing ? existing.email : email;
+    await setContext(client, {
+      globalReadOnly: true,
+      superAdminBootstrap: true,
+      superAdminBootstrapEmail: accountEmail
+    });
     await client.query(
-      `INSERT INTO users (full_name, email, password_hash, role, status, approved_at)
-       VALUES ($1, $2, $3, 'Super Admin', 'Active', NOW())`,
-      [fullName, email, passwordHash]
+      `INSERT INTO users
+        (organization_id, branch_id, full_name, email, password_hash, role, status, approved_at, approved_by)
+       VALUES (NULL, NULL, $1, $2, $3, 'Super Admin', 'Active', NOW(), NULL)
+       ON CONFLICT (email) DO UPDATE SET
+         organization_id = NULL,
+         branch_id = NULL,
+         full_name = EXCLUDED.full_name,
+         role = 'Super Admin',
+         status = 'Active',
+         password_hash = EXCLUDED.password_hash,
+         approved_at = COALESCE(users.approved_at, NOW()),
+         approved_by = NULL,
+         session_version = users.session_version + 1
+       RETURNING id`,
+      [fullName, accountEmail, passwordHash]
     );
+    console.info("Ensured the configured Super Admin account is active and up to date.");
     return true;
   });
 }
 
-const superAdminInitialization = pool
-  ? ensureSuperAdmin().then((created) => {
-      if (created) console.log("Bootstrapped the configured Super Admin account.");
-      return created;
-    }).catch((error) => {
-      console.error("Could not ensure the configured Super Admin account:", error.message);
-      return false;
-    })
-  : Promise.resolve(false);
+const superAdminInitialization = ensureSuperAdmin().catch((error) => {
+  console.error("Could not ensure the configured Super Admin account:", error.message);
+  return false;
+});
 
 function publicUser(user) {
   const { password_hash, session_version, ...safeUser } = user;
@@ -465,6 +492,7 @@ app.post("/api/login", async (req, res) => {
   const email = String(req.body.email || "").trim().toLowerCase();
   const password = String(req.body.password || "");
   try {
+    await superAdminInitialization;
     const { rows } = await readQuery(
       "SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1",
       [email],

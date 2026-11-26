@@ -496,6 +496,25 @@ BEGIN
         AND branch_id IS NULL
         AND status = 'Active'
         AND current_setting('app.bootstrap_super_admin', true) = 'true'
+        AND lower(email) = lower(current_setting('app.bootstrap_super_admin_email', true))
+      );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'users' AND policyname = 'platform_bootstrap_super_admin_update'
+  ) THEN
+    CREATE POLICY platform_bootstrap_super_admin_update ON users FOR UPDATE
+      USING (
+        current_setting('app.bootstrap_super_admin', true) = 'true'
+        AND lower(email) = lower(current_setting('app.bootstrap_super_admin_email', true))
+      )
+      WITH CHECK (
+        role = 'Super Admin'
+        AND organization_id IS NULL
+        AND branch_id IS NULL
+        AND status = 'Active'
+        AND current_setting('app.bootstrap_super_admin', true) = 'true'
+        AND lower(email) = lower(current_setting('app.bootstrap_super_admin_email', true))
       );
   END IF;
   ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
