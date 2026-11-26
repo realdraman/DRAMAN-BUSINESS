@@ -132,6 +132,61 @@ const navItems = [
   { id: "settings", label: "Settings", icon: "settings", roles: ["Admin", "Super Admin"] }
 ];
 
+function normalizeRole(role) {
+  const normalized = String(role || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+  const canonicalRoles = {
+    "super admin": "Super Admin",
+    admin: "Admin",
+    "loan officer": "Loan Officer",
+    cashier: "Cashier",
+    "inventory manager": "Inventory Manager"
+  };
+  return canonicalRoles[normalized] || String(role || "").trim();
+}
+
+function permissionsForRole(permissionMap, role) {
+  const normalizedRole = normalizeRole(role);
+  const matchingKey = Object.keys(permissionMap || {}).find((key) => normalizeRole(key) === normalizedRole);
+  const modules = matchingKey ? permissionMap[matchingKey] : [];
+  return Array.isArray(modules) ? modules : [];
+}
+
+function isSuperAdmin(user) {
+  return normalizeRole(user && user.role) === "Super Admin";
+}
+
+function hasOrganizationSupportOverride(session) {
+  return isSuperAdmin(session && session.user) &&
+    session.support_override &&
+    session.support_override.scope === "organization" &&
+    Number(session.support_override.organization_id) > 0;
+}
+
+function canManageOrganization(session) {
+  const role = normalizeRole(session && session.user && session.user.role);
+  return role === "Admin" || (role === "Super Admin" && hasOrganizationSupportOverride(session));
+}
+
+function canWriteModule(session, settings, moduleName) {
+  const role = normalizeRole(session && session.user && session.user.role);
+  if (role === "Admin") return true;
+  if (role === "Super Admin") return hasOrganizationSupportOverride(session);
+  return permissionsForRole(settings && settings.security && settings.security.permissions, role).includes(moduleName);
+}
+
+function visibleNavigation(role, permissions, hasRolePermissions) {
+  const normalizedRole = normalizeRole(role);
+  if (normalizedRole === "Admin" || normalizedRole === "Super Admin") return navItems;
+  return navItems.filter((item) =>
+    item.id !== "team" && item.id !== "settings" &&
+    (item.id === "dashboard" || permissions.includes(item.id) || (!hasRolePermissions && item.roles.some((itemRole) => normalizeRole(itemRole) === normalizedRole)))
+  );
+}
+
 const emptyCustomerForm = {
   full_name: "",
   national_id: "",
@@ -650,14 +705,8 @@ function LoginScreen({ onLogin, theme, onToggleTheme, initialMessage = "" }) {
   );
 }
 
-function Sidebar({ activeView, setActiveView, user, permissions, supportOverride }) {
-  const allowedNav = navItems.filter((item) =>
-    user.role === "Super Admin" && !supportOverride
-      ? item.id === "dashboard"
-      : user.role === "Super Admin"
-      ? item.roles.includes(user.role)
-      : item.id === "dashboard" || item.roles.includes(user.role) || permissions.includes(item.id)
-  );
+function Sidebar({ activeView, setActiveView, user, permissions, hasRolePermissions }) {
+  const allowedNav = visibleNavigation(user.role, permissions, hasRolePermissions);
 
   return (
     <aside className="sidebar">
@@ -684,7 +733,7 @@ function Sidebar({ activeView, setActiveView, user, permissions, supportOverride
       <div className="role-panel">
         <div className="compact muted">Signed in as</div>
         <strong>{user.full_name}</strong>
-        <div className="compact">{user.role}</div>
+        <div className="compact">{normalizeRole(user.role)}</div>
       </div>
     </aside>
   );
@@ -789,7 +838,7 @@ function SupportOverrideControl({ session, onSessionUpdated }) {
       .catch((requestError) => setError(requestError.message || "Unable to list organizations."));
   }, [isOpen, override]);
 
-  if (session.user.role !== "Super Admin") return null;
+  if (!isSuperAdmin(session.user)) return null;
 
   async function startOverride() {
     setSaving(true);
@@ -917,7 +966,7 @@ function SupportOverrideControl({ session, onSessionUpdated }) {
   );
 }
 
-function Topbar({ user, session, search, setSearch, onLogout, theme, onToggleTheme, onAccountUpdated, onSessionUpdated }) {
+function Topbar({ user, session, search, setSearch, onLogout, theme, onToggleTheme, onAccountUpdated }) {
   return (
     <>
       <header className="topbar">
@@ -932,12 +981,11 @@ function Topbar({ user, session, search, setSearch, onLogout, theme, onToggleThe
         <div className="topbar-actions">
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           <NotificationCenter />
-          <SystemBackup isAdmin={["Admin", "Super Admin"].includes(user.role)} />
-          <SupportOverrideControl session={session} onSessionUpdated={onSessionUpdated} />
+          <SystemBackup isAdmin={["Admin", "Super Admin"].includes(normalizeRole(user.role))} />
           <AccountSettings user={user} onAccountUpdated={onAccountUpdated} />
           <div className="text-right">
             <div className="topbar-user-name font-bold leading-tight">{user.full_name}</div>
-            <div className="compact muted">{user.role}</div>
+            <div className="compact muted">{normalizeRole(user.role)}</div>
           </div>
           <button className="ghost-button" type="button" onClick={onLogout}>
             <Icon name="log-out" />
@@ -1173,7 +1221,7 @@ function LoanTrendChart({ summary, theme }) {
   return <canvas ref={canvasRef} aria-label="Loan trend graph"></canvas>;
 }
 
-function Dashboard({ summary, theme }) {
+function Dashboard({ summary, theme, canCreateLoan, onNavigate }) {
   if (!summary) {
     return <div className="empty-state">Loading dashboard</div>;
   }
@@ -1185,7 +1233,7 @@ function Dashboard({ summary, theme }) {
         title="Dashboard"
         description="Daily operating view for loans, collections, customers, stock value, and profit signals."
         action={
-          <button className="primary-button" type="button">
+          <button className="primary-button" type="button" disabled={!canCreateLoan} onClick={() => canCreateLoan && onNavigate("loans")} title={!canCreateLoan ? "Read-only access" : "Open loan issuance"}>
             <Icon name="plus" />
             New Loan
           </button>
@@ -1294,11 +1342,12 @@ function LowStockAlerts({ items }) {
   );
 }
 
-function CustomerManagement({ customers, refreshData, globalSearch, user }) {
+function CustomerManagement({ customers, refreshData, globalSearch, user, session, settings }) {
   const [form, setForm] = useDraftState("customer", emptyCustomerForm, user.id);
   const [selectedTab, setSelectedTab] = useState("Personal details");
   const [message, setMessage] = useState("");
-  const isSuperAdmin = ["Admin", "Super Admin"].includes(user.role);
+  const canCreateCustomer = canWriteModule(session, settings, "customers");
+  const canDeleteCustomers = canManageOrganization(session);
 
   const filteredCustomers = useMemo(() => {
     const query = globalSearch.trim().toLowerCase();
@@ -1322,6 +1371,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
 
   async function saveCustomer(event) {
     event.preventDefault();
+    if (!canCreateCustomer) return;
     const { data } = await api.post("/api/customers", form);
     setMessage(`${data.full_name} registered as ${data.customer_code}`);
     setForm(emptyCustomerForm);
@@ -1329,7 +1379,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
   }
 
   async function deleteCustomer(customer) {
-    if (!isSuperAdmin) return;
+    if (!canDeleteCustomers) return;
     if (!window.confirm(`Delete ${customer.full_name} and all linked records?`)) return;
     const { data } = await api.delete(`/api/customers/${customer.id}`);
     setMessage(data.message);
@@ -1337,7 +1387,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
   }
 
   async function clearCustomers() {
-    if (!isSuperAdmin || customers.length === 0) return;
+    if (!canDeleteCustomers || customers.length === 0) return;
     if (!window.confirm("Clear all customers, guarantors, loans, payments, sales, and agreements?")) return;
     const { data } = await api.delete("/api/customers");
     setMessage(data.message);
@@ -1351,11 +1401,11 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
         description="Register customers, capture guarantor details, upload required documents, and review customer history."
         action={
           <div className="button-row mt-0">
-            <button className="secondary-button" type="button" onClick={() => document.getElementById("customer-document-input")?.click()}>
+            <button className="secondary-button" type="button" disabled={!canCreateCustomer} onClick={() => document.getElementById("customer-document-input")?.click()}>
               <Icon name="upload" />
               Upload Documents
             </button>
-            {isSuperAdmin ? (
+            {canDeleteCustomers ? (
               <button className="ghost-button" type="button" onClick={clearCustomers} disabled={customers.length === 0}>
                 <Icon name="trash-2" />
                 Clear Customers
@@ -1370,7 +1420,9 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
             <h2>Customer Registration</h2>
             <Badge tone="active">KYC</Badge>
           </div>
+          {!canCreateCustomer ? <p className="panel-body compact muted">Customer registration is read-only during this session.</p> : null}
           <form className="panel-body form-grid" onSubmit={saveCustomer}>
+            <fieldset disabled={!canCreateCustomer} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: "contents" }}>
             <div className="section-title">Personal Information</div>
             <Field label="Full name">
               <input value={form.full_name} onChange={(event) => setField("full_name", event.target.value)} required />
@@ -1454,6 +1506,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
               </button>
             </div>
             {message ? <div className="success-box full">{message}</div> : null}
+            </fieldset>
           </form>
         </div>
         <div className="panel">
@@ -1483,7 +1536,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
                     <th>County</th>
                     <th>ID Images</th>
                     <th>Status</th>
-                    {isSuperAdmin ? <th>Control</th> : null}
+                    {canDeleteCustomers ? <th>Control</th> : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -1506,7 +1559,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
                           {customer.blacklist_status ? "Blacklisted" : "Clear"}
                         </Badge>
                       </td>
-                      {isSuperAdmin ? (
+                      {canDeleteCustomers ? (
                         <td>
                           <button className="ghost-button" type="button" onClick={() => deleteCustomer(customer)}>
                             <Icon name="trash-2" />
@@ -1517,7 +1570,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
                     </tr>
                   )) : (
                     <tr>
-                      <td colSpan={isSuperAdmin ? "6" : "5"}>
+                      <td colSpan={canDeleteCustomers ? "6" : "5"}>
                         <div className="empty-state">No customers registered yet.</div>
                       </td>
                     </tr>
@@ -1532,7 +1585,7 @@ function CustomerManagement({ customers, refreshData, globalSearch, user }) {
   );
 }
 
-function LoanManagement({ customers, loans, refreshData, globalSearch, user, settings }) {
+function LoanManagement({ customers, loans, refreshData, globalSearch, user, settings, session }) {
   const [form, setForm] = useDraftState("loan", {
     ...initialLoanForm,
     interest_rate: settings.loan.default_interest_rate,
@@ -1540,6 +1593,8 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
   }, user.id);
   const [message, setMessage] = useState("");
   const [showPendingOnly, setShowPendingOnly] = useState(false);
+  const canCreateLoan = canWriteModule(session, settings, "loans");
+  const canApproveLoans = canManageOrganization(session);
 
   const filteredLoans = useMemo(() => {
     const query = globalSearch.trim().toLowerCase();
@@ -1577,6 +1632,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
 
   async function saveLoan(event) {
     event.preventDefault();
+    if (!canCreateLoan) return;
     const { data } = await api.post("/api/loans", form);
     setMessage(`${data.loan_code} created for ${data.customer_name}`);
     setForm({
@@ -1588,6 +1644,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
   }
 
   async function approveLoan(loan) {
+    if (!canApproveLoans) return;
     const { data } = await api.post(`/api/loans/${loan.id}/approve`, {});
     setMessage(`${data.loan_code} approved.`);
     await refreshData();
@@ -1604,7 +1661,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
               <Icon name="file-check-2" />
               {showPendingOnly ? "All Loans" : "Approvals"}
             </button>
-            <button className="secondary-button" type="button" onClick={() => document.getElementById("loan-issuance")?.scrollIntoView({ behavior: "smooth" })}>
+            <button className="secondary-button" type="button" disabled={!canCreateLoan} onClick={() => document.getElementById("loan-issuance")?.scrollIntoView({ behavior: "smooth" })}>
               <Icon name="plus" />New Loan
             </button>
           </div>
@@ -1616,7 +1673,9 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
             <h2>Loan Issuance</h2>
             <Badge tone="pending">Approval flow</Badge>
           </div>
+          {!canCreateLoan ? <p className="panel-body compact muted">Loan issuance is read-only during this session.</p> : null}
           <form className="panel-body form-grid" onSubmit={saveLoan}>
+            <fieldset disabled={!canCreateLoan} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: "contents" }}>
             <div className="section-title">Loan Details</div>
             <Field label="Customer selection" full>
               <select value={form.customer_id} onChange={(event) => setField("customer_id", event.target.value)} required>
@@ -1723,6 +1782,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
               </button>
             </div>
             {message ? <div className="success-box full">{message}</div> : null}
+            </fieldset>
           </form>
         </div>
         <div className="panel">
@@ -1741,7 +1801,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                   <th>Due date</th>
                   <th>Status</th>
                   <th>Officer</th>
-                  {["Admin", "Super Admin"].includes(user.role) ? <th>Action</th> : null}
+                  {canApproveLoans ? <th>Action</th> : null}
                 </tr>
               </thead>
               <tbody>
@@ -1754,7 +1814,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                     <td>{formatDate(loan.due_date)}</td>
                     <td><Badge tone={loan.status}>{loan.status}</Badge></td>
                     <td>{loan.assigned_officer}</td>
-                    {["Admin", "Super Admin"].includes(user.role) ? (
+                    {canApproveLoans ? (
                       <td>{loan.status === "Pending" ? (
                         <button className="secondary-button" type="button" onClick={() => approveLoan(loan)}>Approve</button>
                       ) : <span className="compact muted">—</span>}</td>
@@ -1762,7 +1822,7 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
                   </tr>
                 )) : (
                   <tr>
-                    <td colSpan={["Admin", "Super Admin"].includes(user.role) ? "8" : "7"}>
+                    <td colSpan={canApproveLoans ? "8" : "7"}>
                       <div className="empty-state">No loans issued yet.</div>
                     </td>
                   </tr>
@@ -1776,12 +1836,13 @@ function LoanManagement({ customers, loans, refreshData, globalSearch, user, set
   );
 }
 
-function PaymentManagement({ loans, payments, refreshData, user, settings }) {
+function PaymentManagement({ loans, payments, refreshData, user, settings, session }) {
   const payableLoans = loans.filter((loan) => Number(loan.balance) > 0 && loan.status !== "Pending");
   const [form, setForm] = useDraftState("payment", initialPaymentForm, user.id);
   const [lastReceipt, setLastReceipt] = useDraftState("payment-receipt", null, user.id);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const canReceivePayment = canWriteModule(session, settings, "payments");
   const selectedLoan = loans.find((loan) => loan.id === Number(form.loan_id));
 
   function setField(field, value) {
@@ -1791,6 +1852,7 @@ function PaymentManagement({ loans, payments, refreshData, user, settings }) {
   async function savePayment(event) {
     event.preventDefault();
     setError("");
+    if (!canReceivePayment) return;
     const { data } = await api.post("/api/payments", {
       ...form,
       received_by: user.id
@@ -1848,7 +1910,9 @@ function PaymentManagement({ loans, payments, refreshData, user, settings }) {
             <h2>Payment Form</h2>
             <Badge tone="active">Auto-balance</Badge>
           </div>
+          {!canReceivePayment ? <p className="panel-body compact muted">Payment entry is read-only during this session.</p> : null}
           <form className="panel-body form-grid" onSubmit={savePayment}>
+            <fieldset disabled={!canReceivePayment} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: "contents" }}>
             <Field label="Customer / loan selection" full>
               <select value={form.loan_id} onChange={(event) => setField("loan_id", event.target.value)} required>
                 <option value="">Select active loan</option>
@@ -1917,6 +1981,7 @@ function PaymentManagement({ loans, payments, refreshData, user, settings }) {
             <p className="compact muted full">SMS opens the device messaging app with the receipt details ready to send.</p>
             {message ? <div className="success-box full">{message}</div> : null}
             {error ? <div className="error-box full" role="alert">{error}</div> : null}
+            </fieldset>
           </form>
         </div>
         <ReceiptPreview selectedLoan={selectedLoan} amount={form.amount_paid} user={user} receipt={selectedLoan ? null : lastReceipt} settings={settings} />
@@ -2019,11 +2084,11 @@ function ReceiptPreview({ selectedLoan, amount, user, receipt, settings }) {
   );
 }
 
-function InventoryManagement({ inventory, refreshData, user, settings }) {
+function InventoryManagement({ inventory, refreshData, user, settings, session }) {
   const [productForm, setProductForm] = useDraftState("product", emptyProductForm, user.id);
   const [message, setMessage] = useState("");
-  const isSuperAdmin = ["Admin", "Super Admin"].includes(user.role);
-  const canManageInventory = isSuperAdmin || (settings.security.permissions[user.role] || []).includes("inventory");
+  const canManageInventory = canWriteModule(session, settings, "inventory");
+  const canClearInventory = canManageOrganization(session);
   const stockValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.buying_price), 0);
   const retailValue = inventory.reduce((sum, item) => sum + Number(item.quantity) * Number(item.selling_price), 0);
 
@@ -2054,7 +2119,7 @@ function InventoryManagement({ inventory, refreshData, user, settings }) {
   }
 
   async function clearProducts() {
-    if (!isSuperAdmin || inventory.length === 0) return;
+    if (!canClearInventory || inventory.length === 0) return;
     if (!window.confirm("Clear all product records and linked sales?")) return;
     const { data } = await api.delete("/api/inventory");
     setMessage(data.message);
@@ -2067,7 +2132,7 @@ function InventoryManagement({ inventory, refreshData, user, settings }) {
         title="Inventory & Sales"
         description="Manage second-hand stock, furniture sales, product categories, and installment ownership records."
         action={
-          isSuperAdmin ? (
+          canClearInventory ? (
             <button className="ghost-button" type="button" onClick={clearProducts} disabled={inventory.length === 0}>
               <Icon name="trash-2" />
               Clear Products
@@ -2085,7 +2150,7 @@ function InventoryManagement({ inventory, refreshData, user, settings }) {
         <section className="panel">
           <div className="panel-header">
             <h2>Add Product</h2>
-            <Badge tone="active">Super Admin</Badge>
+            <Badge tone="active">Inventory access</Badge>
           </div>
           <form className="panel-body form-grid" onSubmit={saveProduct}>
             <Field label="Product name">
@@ -2273,13 +2338,14 @@ function Reports({ summary, loans, inventory }) {
   );
 }
 
-function Agreements({ agreements, loans }) {
+function Agreements({ agreements, loans, session, settings }) {
+  const canGenerate = canWriteModule(session, settings, "agreements");
   return (
     <>
       <SectionHeading
         title="Agreements & Documents"
         description="Generate loan agreements, guarantor forms, receipts, clearance certificates, and installment agreements."
-        action={<button className="primary-button" type="button"><Icon name="file-plus-2" />Generate Document</button>}
+        action={<button className="primary-button" type="button" disabled={!canGenerate}><Icon name="file-plus-2" />Generate Document</button>}
       />
       <section className="panel">
         <div className="panel-header">
@@ -2308,11 +2374,13 @@ function Agreements({ agreements, loans }) {
   );
 }
 
-function Settings({ settings, onSettingsChanged }) {
+function Settings({ settings, onSettingsChanged, session, onSessionUpdated }) {
   const [draft, setDraft] = useState(settings);
   const [saving, setSaving] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const canEditSettings = canManageOrganization(session);
+  const superAdmin = isSuperAdmin(session.user);
 
   useEffect(() => setDraft(settings), [settings]);
 
@@ -2325,6 +2393,7 @@ function Settings({ settings, onSettingsChanged }) {
 
   async function saveSection(section, event) {
     event.preventDefault();
+    if (!canEditSettings) return;
     setSaving(section);
     setError("");
     setMessage("");
@@ -2340,6 +2409,7 @@ function Settings({ settings, onSettingsChanged }) {
   }
 
   async function uploadLogo(event) {
+    if (!canEditSettings) return;
     const file = event.target.files && event.target.files[0];
     if (!file) return;
     if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type) || file.size > 1024 * 1024) {
@@ -2399,6 +2469,16 @@ function Settings({ settings, onSettingsChanged }) {
   return (
     <>
       <SectionHeading title="Settings" description="Update business identity and receipts, loan defaults and approvals, and account security policies." />
+      {superAdmin ? (
+        <section className="panel settings-notice">
+          <div className="panel-header"><h2>Support Override</h2><Icon name="shield-check" /></div>
+          <div className="panel-body">
+            <p className="compact muted">Super Admin access is read-only by default. Organization overrides require a reason and audit every write.</p>
+            <SupportOverrideControl session={session} onSessionUpdated={onSessionUpdated} />
+          </div>
+        </section>
+      ) : null}
+      {!canEditSettings ? <div className="panel compact muted settings-notice">System preferences are read-only until an organization support override is active. Starting an override requires a reason and every write is added to the audit log.</div> : null}
       {message ? <div className="success-box settings-notice" role="status">{message}</div> : null}
       {error ? <div className="error-box settings-notice" role="alert">{error}</div> : null}
       <section className="three-column settings-grid">
@@ -2411,14 +2491,72 @@ function Settings({ settings, onSettingsChanged }) {
             onSave={saveSection}
             onUploadLogo={uploadLogo}
             saving={saving === group.section}
+            readOnly={!canEditSettings}
           />
         ))}
       </section>
+      {superAdmin ? <SuperAdminAuditLog session={session} /> : null}
     </>
   );
 }
 
-function TeamAccess() {
+function SuperAdminAuditLog({ session }) {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function loadAudit() {
+    setLoading(true);
+    setError("");
+    try {
+      const { data } = await api.get("/api/support-override-audit");
+      setEntries(Array.isArray(data) ? data : []);
+    } catch (requestError) {
+      setError(requestError.message || "Unable to load the support audit log.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadAudit();
+  }, [session.support_override && session.support_override.scope, session.support_override && session.support_override.organization_id]);
+
+  return (
+    <section className="panel settings-notice">
+      <div className="panel-header">
+        <div>
+          <h2>Super Admin Audit Logs</h2>
+          <span className="compact muted">Support override starts, ends, and writes are recorded with their reason.</span>
+        </div>
+        <button className="secondary-button" type="button" onClick={loadAudit} disabled={loading}>
+          <Icon name="refresh-cw" />{loading ? "Refreshing..." : "Refresh"}
+        </button>
+      </div>
+      {error ? <div className="error-box" role="alert">{error}</div> : null}
+      <div className="panel-body table-wrap">
+        <table className="data-table">
+          <thead><tr><th>Time</th><th>Actor ID</th><th>Organization</th><th>Scope</th><th>Action</th><th>Reason</th><th>Request</th></tr></thead>
+          <tbody>
+            {entries.length ? entries.map((entry) => (
+              <tr key={entry.id}>
+                <td>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "—"}</td>
+                <td>{entry.actor_user_id}</td>
+                <td>{entry.organization_id == null ? "All organizations" : entry.organization_id}</td>
+                <td>{entry.scope}</td>
+                <td>{entry.action}</td>
+                <td>{entry.reason || "—"}</td>
+                <td>{[entry.request_method, entry.request_path].filter(Boolean).join(" ") || "—"}</td>
+              </tr>
+            )) : <tr><td colSpan="7"><div className="empty-state">{loading ? "Loading audit log..." : "No support audit events yet."}</div></td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TeamAccess({ session }) {
   const [role, setRole] = useState("Cashier");
   const [count, setCount] = useState(1);
   const [activationStatus, setActivationStatus] = useState("Pending");
@@ -2433,6 +2571,7 @@ function TeamAccess() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const canManageTeam = canManageOrganization(session);
 
   async function refreshAccess() {
     const [teamResult, inviteResult, branchResult] = await Promise.all([
@@ -2452,6 +2591,7 @@ function TeamAccess() {
 
   async function createInvitation(event) {
     event.preventDefault();
+    if (!canManageTeam) return;
     setLoading(true);
     setError("");
     setMessage("");
@@ -2483,6 +2623,7 @@ function TeamAccess() {
   }
 
   async function approveAccount(memberId) {
+    if (!canManageTeam) return;
     setApprovingId(memberId);
     setError("");
     setMessage("");
@@ -2501,6 +2642,7 @@ function TeamAccess() {
   }
 
   async function revokeInvitation(invitationId) {
+    if (!canManageTeam) return;
     setRevokingId(invitationId);
     setError("");
     setMessage("");
@@ -2519,8 +2661,9 @@ function TeamAccess() {
     <>
       <SectionHeading
         title="Team Access"
-        description="Manage organization-scoped invitations and activate staff using the credentials they created."
+        description="Manage organization administrators, staff approvals, branch assignments, and role-specific invitation codes."
       />
+      {!canManageTeam ? <div className="panel compact muted settings-notice" role="status">Team Access is read-only. Organization Admins can manage their team; Super Admin writes require an active organization support override.</div> : null}
       <section className="team-access-layout">
         <div className="panel">
           <div className="panel-header">
@@ -2528,9 +2671,10 @@ function TeamAccess() {
               <h2>Issue an invitation</h2>
               <span className="compact muted">Codes are role-specific and expire in 24 hours.</span>
             </div>
-            <Badge tone="active">Admin only</Badge>
+            <Badge tone="active">{canManageTeam ? "Team management" : "Read only"}</Badge>
           </div>
           <form className="panel-body" onSubmit={createInvitation}>
+            <fieldset disabled={!canManageTeam} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
             <div className="form-grid single">
               <Field label="Account role">
                 <select value={role} onChange={(event) => setRole(event.target.value)}>
@@ -2573,6 +2717,7 @@ function TeamAccess() {
             ) : null}
             {error ? <div className="error-box" role="alert">{error}</div> : null}
             {message ? <div className="success-box" role="status">{message}</div> : null}
+            </fieldset>
           </form>
         </div>
         <div className="panel">
@@ -2585,12 +2730,12 @@ function TeamAccess() {
               {invitations.map((invitation) => (
                 <div className="invitation-row" key={invitation.id}>
                 <div>
-                  <strong>{invitation.role === "Admin" ? "Organization Admin" : invitation.role}</strong>
+                  <strong>{normalizeRole(invitation.role) === "Admin" ? "Organization Admin" : normalizeRole(invitation.role)}</strong>
                   <span>{branches.find((branch) => branch.id === invitation.branch_id)?.name || "Branch unavailable"} · {invitation.activation_status === "Active" ? "Active immediately" : "Approval required"} · Expires {formatDate(invitation.expires_at)}</span>
                 </div>
                 <Badge tone={invitation.status}>{invitation.status}</Badge>
                 {invitation.status === "Available" ? (
-                  <button className="ghost-button" type="button" disabled={revokingId === invitation.id} onClick={() => revokeInvitation(invitation.id)}>
+                  <button className="ghost-button" type="button" disabled={!canManageTeam || revokingId === invitation.id} onClick={() => revokeInvitation(invitation.id)}>
                     <Icon name="ban" />{revokingId === invitation.id ? "Revoking..." : "Revoke"}
                   </button>
                 ) : null}
@@ -2615,7 +2760,7 @@ function TeamAccess() {
                     <td><strong>{member.full_name}</strong></td>
                     <td><span className="team-id">{member.employee_id || "Not assigned"}</span></td>
                     <td>{member.email}</td>
-                    <td>{member.role === "Admin" ? "Organization Admin" : member.role}</td>
+                    <td>{normalizeRole(member.role) === "Admin" ? "Organization Admin" : normalizeRole(member.role)}</td>
                     <td>{branches.find((branch) => branch.id === member.branch_id)?.name || "Unassigned"}</td>
                     <td><Badge tone={member.status}>{member.status}</Badge></td>
                     <td>
@@ -2625,12 +2770,12 @@ function TeamAccess() {
                             className="branch-select"
                             aria-label={`Branch for ${member.full_name}`}
                             value={approvalBranches[member.id] || member.branch_id || branchId}
-                            disabled={Boolean(member.branch_id)}
+                            disabled={!canManageTeam || Boolean(member.branch_id)}
                             onChange={(event) => setApprovalBranches({ ...approvalBranches, [member.id]: event.target.value })}
                           >
                             {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
                           </select>
-                          <button className="primary-button" type="button" disabled={approvingId === member.id} onClick={() => approveAccount(member.id)}>
+                          <button className="primary-button" type="button" disabled={!canManageTeam || approvingId === member.id} onClick={() => approveAccount(member.id)}>
                             {approvingId === member.id ? "Approving..." : "Approve"}
                           </button>
                         </div>
@@ -2648,7 +2793,7 @@ function TeamAccess() {
   );
 }
 
-function SettingsPanel({ title, icon, section, values, fields, onChange, onSave, onUploadLogo, saving }) {
+function SettingsPanel({ title, icon, section, values, fields, onChange, onSave, onUploadLogo, saving, readOnly }) {
   return (
     <div className="panel">
       <div className="panel-header">
@@ -2656,6 +2801,7 @@ function SettingsPanel({ title, icon, section, values, fields, onChange, onSave,
         <Icon name={icon} />
       </div>
       <form className="panel-body settings-form" onSubmit={(event) => onSave(section, event)}>
+        <fieldset disabled={readOnly} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: "contents" }}>
         {fields.map((field) => (
           <Field label={field.label} key={field.key}>
             {field.type === "checkbox" ? (
@@ -2685,13 +2831,15 @@ function SettingsPanel({ title, icon, section, values, fields, onChange, onSave,
                         <label key={module}>
                           <input
                             type="checkbox"
-                            checked={values.permissions[role].includes(module)}
+                            checked={permissionsForRole(values.permissions, role).includes(module)}
                             onChange={(event) => {
-                              const currentModules = values.permissions[role];
+                              const permissionMap = values.permissions || {};
+                              const permissionKey = Object.keys(permissionMap).find((key) => normalizeRole(key) === normalizeRole(role)) || role;
+                              const currentModules = permissionsForRole(permissionMap, role);
                               const nextModules = event.target.checked
                                 ? [...currentModules, module]
                                 : currentModules.filter((item) => item !== module);
-                              onChange(section, "permissions", { ...values.permissions, [role]: nextModules });
+                              onChange(section, "permissions", { ...permissionMap, [permissionKey]: nextModules });
                             }}
                           />
                           {module.charAt(0).toUpperCase() + module.slice(1)}
@@ -2714,9 +2862,10 @@ function SettingsPanel({ title, icon, section, values, fields, onChange, onSave,
           </Field>
         ))}
         {section === "security" ? <p className="settings-help">Session-timeout changes apply on the next sign-in. Backup scheduling is saved as a preference; automated backups require a persistent production data store.</p> : null}
-        <button className="primary-button" type="submit" disabled={saving}>
+        <button className="primary-button" type="submit" disabled={saving || readOnly}>
           <Icon name="save" />{saving ? "Saving..." : "Save changes"}
         </button>
+        </fieldset>
       </form>
     </div>
   );
@@ -2735,8 +2884,9 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
 
   async function refreshData() {
     const settingsResult = await api.get("/api/settings");
-    const modules = settingsResult.data.security.permissions[session.user.role] || [];
-    const canAccess = (moduleName) => ["Admin", "Super Admin"].includes(session.user.role) || modules.includes(moduleName);
+    const role = normalizeRole(session.user.role);
+    const modules = permissionsForRole(settingsResult.data.security.permissions, role);
+    const canAccess = (moduleName) => ["Admin", "Super Admin"].includes(role) || modules.includes(moduleName);
     const [summaryResult, customersResult, loansResult, paymentsResult, inventoryResult, agreementsResult] = await Promise.all([
       api.get("/api/summary"),
       canAccess("customers") ? api.get("/api/customers") : Promise.resolve({ data: [] }),
@@ -2756,7 +2906,7 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
 
   useEffect(() => {
     refreshData();
-  }, [session.support_override ? session.support_override.organization_id : null]);
+  }, [session.support_override && session.support_override.scope, session.support_override && session.support_override.organization_id]);
 
   const viewProps = {
     summary,
@@ -2768,18 +2918,16 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
     refreshData,
     globalSearch: search,
     user: session.user,
+    session,
     theme,
-    settings
+    settings,
+    canCreateLoan: canWriteModule(session, settings, "loans"),
+    onNavigate: setActiveView
   };
 
-  const permissions = settings.security.permissions[session.user.role] || [];
-  const visibleNav = navItems.filter((item) =>
-    session.user.role === "Super Admin" && !session.support_override
-      ? item.id === "dashboard"
-      : session.user.role === "Super Admin"
-      ? item.roles.includes(session.user.role)
-      : item.id === "dashboard" || item.roles.includes(session.user.role) || permissions.includes(item.id)
-  );
+  const permissions = permissionsForRole(settings.security.permissions, session.user.role);
+  const hasRolePermissions = Object.keys(settings.security.permissions || {}).some((key) => normalizeRole(key) === normalizeRole(session.user.role));
+  const visibleNav = visibleNavigation(session.user.role, permissions, hasRolePermissions);
   useEffect(() => {
     if (!visibleNav.some((item) => item.id === activeView)) {
       setActiveView("dashboard");
@@ -2788,9 +2936,9 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
 
   return (
     <div className="app-shell">
-      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} supportOverride={session.support_override} />
+      <Sidebar activeView={activeView} setActiveView={setActiveView} user={session.user} permissions={permissions} hasRolePermissions={hasRolePermissions} />
       <div className="workspace">
-        <Topbar user={session.user} session={session} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} onAccountUpdated={onAccountUpdated} onSessionUpdated={onSessionUpdated} />
+        <Topbar user={session.user} session={session} search={search} setSearch={setSearch} onLogout={onLogout} theme={theme} onToggleTheme={onToggleTheme} onAccountUpdated={onAccountUpdated} />
         <main className="main-content">
           {activeView === "dashboard" ? <Dashboard {...viewProps} /> : null}
           {activeView === "customers" ? <CustomerManagement {...viewProps} /> : null}
@@ -2799,8 +2947,8 @@ function AppShell({ session, onLogout, onAccountUpdated, onSessionUpdated, theme
           {activeView === "inventory" ? <InventoryManagement {...viewProps} /> : null}
           {activeView === "reports" ? <Reports {...viewProps} /> : null}
           {activeView === "agreements" ? <Agreements {...viewProps} /> : null}
-          {activeView === "team" ? <TeamAccess /> : null}
-          {activeView === "settings" ? <Settings {...viewProps} onSettingsChanged={setSettings} /> : null}
+          {activeView === "team" ? <TeamAccess session={session} /> : null}
+          {activeView === "settings" ? <Settings {...viewProps} onSettingsChanged={setSettings} onSessionUpdated={onSessionUpdated} /> : null}
         </main>
       </div>
     </div>
